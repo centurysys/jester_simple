@@ -9,7 +9,8 @@ import net, strtabs, re, tables, os, strutils, uri,
        logging, httpcore, macrocache, json, options,
        strformat
 
-import jestersimple/private/[errorpages, utils, responsevalidation, trustboundary, staticfiles]
+import jestersimple/private/[errorpages, utils, responsevalidation,
+                              trustboundary, staticfiles, headerlogging]
 import jestersimple/[request, patterns]
 
 
@@ -83,7 +84,7 @@ type
 const jesterVer = "1.0.0"
 
 proc toStr(headers: Option[RawHeaders]): string =
-  return $newHttpHeaders(headers.get(@({:})))
+  return formatHeadersForLog(headers.get(@({:})))
 
 proc createHeaders(headers: RawHeaders): string =
   result = ""
@@ -115,10 +116,11 @@ proc send(
 
 proc statusContent(request: Request, status: HttpCode, content: string,
                    headers: Option[RawHeaders]): Future[void] =
-  if request.getNativeReq.rawOutputStarted:
-    # A route attempted to mix raw and managed output. Never append a second
-    # HTTP status line to an already-started raw response.
-    logging.error("Rejected managed response after raw output")
+  if request.getNativeReq.responseStarted:
+    # Never append HTTP headers after a managed/raw response or Upgrade.
+    # In particular, an exception after HTTP 101 must close the connection,
+    # not dispatch a second HTTP status line (such as HTTP 500).
+    logging.error("Rejected managed response after output was started")
     request.getNativeReq.abortRawWrites()
     return newCompletedFuture()
   try:
@@ -157,11 +159,17 @@ proc sendHeaders*(request: Request, status: HttpCode,
   ## Sends ``status`` and ``headers`` to the client socket immediately.
   ## The user is then able to send the content immediately to the client on
   ## the fly through the use of ``response.client``.
+  if request.upgradeStarted or
+      (request.getNativeReq.responseStarted and
+       not request.getNativeReq.rawOutputStarted):
+    raise newException(ValueError,
+      "Raw HTTP headers are forbidden after response or Upgrade")
   validateRawHeaders(headers)
   let headerData = createResponse(status, headers)
   try:
     request.send(headerData)
-    logging.debug("  $1 $2" % [$status, $headers])
+    when not defined(release):
+      logging.debug("  $1 $2" % [$status, formatHeadersForLog(headers)])
   except:
     logging.error("Could not send response: $1" % [osErrorMsg(osLastError())])
 
@@ -248,7 +256,7 @@ proc sendPinnedStatic(
       let chunk = readStaticChunk(asset.fd, count)
       if chunk.len != count:
         raise newException(IOError, "Static file changed during transfer")
-      await req.getNativeReq.client.send(chunk)
+      await req.getNativeReq.sendStreamChunk(chunk)
       remaining -= int64(chunk.len)
   except CatchableError:
     # Headers may already have been sent, so a second status line would
@@ -417,7 +425,16 @@ proc handleRequestSlow(
 # Avoid logging or returning the invalid path as part of an error message.
 # ------------------------------------------------------------------------------
 proc handleRequest(jes: Jester, httpReq: NativeRequest): Future[void] =
-  var req = initRequest(httpReq, jes.settings)
+  var req: Request
+  try:
+    req = initRequest(httpReq, jes.settings)
+  except CatchableError:
+    # Origin metadata is derived during initialization. A configuration or
+    # parsing failure must not escape the callback and leave the peer hanging.
+    # Do not log the untrusted Host or forwarded header contents.
+    logging.error("Failed to initialize HTTP request metadata")
+    return httpReq.respond(Http500, errorpages.error($Http500, jesterVer),
+      newHttpHeaders(@({"Content-Type": "text/html;charset=utf-8"})))
   try:
     try:
       discard req.pathInfo
@@ -466,7 +483,8 @@ proc newSettings*(
   futureErrorHandler: proc (fut: Future[void]) {.closure, gcsafe.} = nil,
   maxConnections = 64, maxHeaderBytes = 16384, maxHeaderFields = 100,
   headerTimeoutMs = 5000, bodyTimeoutMs = 15000,
-  keepAliveTimeoutMs = 5000,
+  keepAliveTimeoutMs = 5000, managedSendTimeoutMs = 15000,
+  responseStartTimeoutMs = 15000, streamTotalTimeoutMs = 60000,
   trustedProxies: seq[string] = @[],
   allowedHosts: seq[string] = @[],
   publicBaseUrl = ""
@@ -484,6 +502,9 @@ proc newSettings*(
     headerTimeoutMs: headerTimeoutMs,
     bodyTimeoutMs: bodyTimeoutMs,
     keepAliveTimeoutMs: keepAliveTimeoutMs,
+    managedSendTimeoutMs: managedSendTimeoutMs,
+    responseStartTimeoutMs: responseStartTimeoutMs,
+    streamTotalTimeoutMs: streamTotalTimeoutMs,
     trustedProxies: trustedProxies,
     allowedHosts: allowedHosts,
     publicBaseUrl: publicBaseUrl,
@@ -563,23 +584,27 @@ proc serve*(
     addHandler(logging.newConsoleLogger())
     setLogFilter(when defined(release): lvlInfo else: lvlDebug)
 
-  assert self.settings.staticDir.len > 0, "Static dir cannot be an empty string."
-  validateOriginSettings(self.settings)
+  # Preserve the pre-start configuration, but do not reuse the caller's
+  # mutable Settings reference as the live server configuration.
+  let activeSettings = snapshotSettings(self.settings)
+  validateServerSettings(activeSettings)
+  validateOriginSettings(activeSettings)
 
-  if self.settings.bindAddr.len > 0:
+  if activeSettings.bindAddr.len > 0:
     logging.info("Jester Simple listening at http://$1:$2$3" %
       [
-        self.settings.bindAddr, $self.settings.port, self.settings.appName
+        activeSettings.bindAddr, $activeSettings.port, activeSettings.appName
       ]
     )
   else:
     logging.info("Jester Simple listening at http://0.0.0.0:$1$2" %
-                 [$self.settings.port, self.settings.appName])
+                 [$activeSettings.port, activeSettings.appName])
 
   var jes = self
+  jes.settings = activeSettings
   let domain = block:
-    if self.settings.bindAddr != "":
-      let ip = self.settings.bindAddr.parseIpAddress()
+    if activeSettings.bindAddr != "":
+      let ip = activeSettings.bindAddr.parseIpAddress()
       if ip.family == IPv4:
         AF_INET
       else:
@@ -587,22 +612,25 @@ proc serve*(
     else:
       AF_INET
   self.httpServer = newAsyncHttpServer(
-    reusePort = self.settings.reusePort,
-    maxBody = self.settings.maxBody,
-    maxConnections = self.settings.maxConnections,
-    maxHeaderBytes = self.settings.maxHeaderBytes,
-    maxHeaderFields = self.settings.maxHeaderFields,
-    headerTimeoutMs = self.settings.headerTimeoutMs,
-    bodyTimeoutMs = self.settings.bodyTimeoutMs,
-    keepAliveTimeoutMs = self.settings.keepAliveTimeoutMs
+    reusePort = activeSettings.reusePort,
+    maxBody = activeSettings.maxBody,
+    maxConnections = activeSettings.maxConnections,
+    maxHeaderBytes = activeSettings.maxHeaderBytes,
+    maxHeaderFields = activeSettings.maxHeaderFields,
+    headerTimeoutMs = activeSettings.headerTimeoutMs,
+    bodyTimeoutMs = activeSettings.bodyTimeoutMs,
+    keepAliveTimeoutMs = activeSettings.keepAliveTimeoutMs,
+    managedSendTimeoutMs = activeSettings.managedSendTimeoutMs,
+    responseStartTimeoutMs = activeSettings.responseStartTimeoutMs,
+    streamTotalTimeoutMs = activeSettings.streamTotalTimeoutMs
   )
   let serveFut = self.httpServer.serve(
-    self.settings.port,
+    activeSettings.port,
     proc (req: httptransport.Request): Future[void] {.gcsafe, closure.} =
       result = handleRequest(jes, req),
-    self.settings.bindAddr, domain = domain)
-  if not self.settings.futureErrorHandler.isNil:
-    serveFut.callback = self.settings.futureErrorHandler
+    activeSettings.bindAddr, domain = domain)
+  if not activeSettings.futureErrorHandler.isNil:
+    serveFut.callback = activeSettings.futureErrorHandler
   else:
     asyncCheck serveFut
   runForever()
@@ -1216,7 +1244,7 @@ proc processRoutesBody(
           error("Expected identifier.", extend[1])
 
         let prefix =
-          if extend.len > 1:
+          if extend.len > 2:
             extend[2].strVal
           else:
             ""

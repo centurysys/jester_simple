@@ -8,7 +8,7 @@ type
     typ*: NodeType
     text*: string
     optional*: bool
-  
+
   Pattern* = seq[Node]
 
 #/show/@id/?
@@ -46,7 +46,10 @@ proc parsePattern*(pattern: string): Pattern =
       result.addNode(NodeField, nparam, optional)
       if pattern{i} == '?': inc(i) # Only skip ?. / should not be skipped.
     of '?':
-      var optionalChar = text[^1]
+      if text.len == 0:
+        raise newException(ValueError,
+          "Optional marker '?' must follow a literal character")
+      let optionalChar = text[^1]
       setLen(text, text.len-1) # Truncate ``text``.
       # Add the stored text.
       if text != "":
@@ -57,6 +60,9 @@ proc parsePattern*(pattern: string): Pattern =
       result.addNode(NodeText, $optionalChar, true)
     of '\\':
       inc i # Skip \
+      if i >= pattern.len:
+        raise newException(ValueError,
+          "Trailing escape character in route pattern")
       if pattern[i] notin {'?', '@', '\\'}:
         raise newException(ValueError, 
                 "This character does not require escaping: " & pattern[i])
@@ -65,7 +71,7 @@ proc parsePattern*(pattern: string): Pattern =
     else:
       text.add(pattern{i})
       inc(i)
-  
+
   if text != "":
     result.addNode(NodeText, text, false)
 
@@ -134,7 +140,7 @@ when isMainModule:
   doAssert(match(f2, "/test42/somefile/").params["ext"] == "")
   doAssert(match(f2, "/test42/somefile.txt").params["ext"] == "txt")
   doAssert(match(f2, "/test42/somefile.txt/").params["ext"] == "txt")
-  
+
   let f3 = parsePattern(r"/test32/\@\\\??")
   doAssert(match(f3, r"/test32/@\").matched)
   doAssert(not match(f3, r"/test32/@\\").matched)

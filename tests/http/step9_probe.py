@@ -96,7 +96,7 @@ def main():
     test('trusted_mixed_header_families_ignored', 5488, {'Host': 'localhost:5488',
          'Forwarded': 'for=192.0.2.4;proto=https;host=gw.example.test',
          'X-Forwarded-For': '203.0.113.200', 'X-Forwarded-Proto': 'http'}, 200,
-         '127.0.0.1|false|localhost|5488|http://localhost:5488/next')
+         '127.0.0.1|false||5488|/next')
     test('trusted_invalid_forwarded_for', 5488, {'Host': 'localhost:5488',
          'Forwarded': 'for=unknown;proto=https;host=gw.example.test'}, 200,
          '127.0.0.1|true|gw.example.test|443|https://gw.example.test/next')

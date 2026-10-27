@@ -19,12 +19,48 @@ type
     headerTimeoutMs*: int
     bodyTimeoutMs*: int
     keepAliveTimeoutMs*: int
+    managedSendTimeoutMs*: int
+    responseStartTimeoutMs*: int
+    streamTotalTimeoutMs*: int
     trustedProxies*: seq[string]
     allowedHosts*: seq[string]
     publicBaseUrl*: string
     futureErrorHandler*: proc (fut: Future[void]) {.closure, gcsafe.}
 
   JesterError* = object of CatchableError
+
+# ------------------------------------------------------------------------------
+# API: Make a per-server copy of mutable Settings before accepting requests.
+# ------------------------------------------------------------------------------
+proc snapshotSettings*(source: Settings): Settings =
+  if source.isNil:
+    raise newException(ValueError, "Server settings are nil")
+  new(result)
+  result[] = source[]
+  # Nim seq assignment can share storage; copy the allowlists explicitly.
+  result.trustedProxies = @[]
+  for network in source.trustedProxies:
+    result.trustedProxies.add(network)
+  result.allowedHosts = @[]
+  for host in source.allowedHosts:
+    result.allowedHosts.add(host)
+
+# ------------------------------------------------------------------------------
+# API: Reject invalid resource limits instead of silently clamping at listen.
+# ------------------------------------------------------------------------------
+proc validateServerSettings*(settings: Settings) =
+  if settings.isNil:
+    raise newException(ValueError, "Server settings are nil")
+  if settings.staticDir.len == 0:
+    raise newException(ValueError, "Static dir cannot be empty")
+  if settings.maxBody < 0 or settings.maxConnections < 1 or
+      settings.maxHeaderBytes < 1 or settings.maxHeaderFields < 1 or
+      settings.headerTimeoutMs < 1 or settings.bodyTimeoutMs < 1 or
+      settings.keepAliveTimeoutMs < 1 or
+      settings.managedSendTimeoutMs < 1 or
+      settings.responseStartTimeoutMs < 1 or
+      settings.streamTotalTimeoutMs < 1:
+    raise newException(ValueError, "Invalid HTTP resource limits")
 
 proc parseUrlQuery*(query: string, result: var Table[string, string])
     {.deprecated: "use request.params or decodedFormPairs".} =
