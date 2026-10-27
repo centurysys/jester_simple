@@ -9,7 +9,8 @@ import net, strtabs, re, tables, os, strutils, uri,
        logging, httpcore, macrocache, json, options,
        strformat
 
-import jestersimple/private/[errorpages, utils, responsevalidation, trustboundary, staticfiles]
+import jestersimple/private/[errorpages, utils, responsevalidation,
+                              trustboundary, staticfiles, headerlogging]
 import jestersimple/[request, patterns]
 
 
@@ -83,7 +84,7 @@ type
 const jesterVer = "1.0.0"
 
 proc toStr(headers: Option[RawHeaders]): string =
-  return $newHttpHeaders(headers.get(@({:})))
+  return formatHeadersForLog(headers.get(@({:})))
 
 proc createHeaders(headers: RawHeaders): string =
   result = ""
@@ -161,7 +162,8 @@ proc sendHeaders*(request: Request, status: HttpCode,
   let headerData = createResponse(status, headers)
   try:
     request.send(headerData)
-    logging.debug("  $1 $2" % [$status, $headers])
+    when not defined(release):
+      logging.debug("  $1 $2" % [$status, formatHeadersForLog(headers)])
   except:
     logging.error("Could not send response: $1" % [osErrorMsg(osLastError())])
 
