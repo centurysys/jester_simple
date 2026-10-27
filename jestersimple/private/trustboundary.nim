@@ -254,15 +254,22 @@ proc clientFromChain(values: seq[string], peer: string,
     current = next
   result = current
 
+# ------------------------------------------------------------------------------
+# A nonempty allowedHosts is an exhaustive list for derived request origins.
+# Only the empty-list compatibility mode implicitly trusts local/bind hosts.
+# ------------------------------------------------------------------------------
 proc isAllowedHost(host: string, allowed: seq[string], bindAddr: string): bool =
+  if allowed.len > 0:
+    for configured in allowed:
+      if cmpIgnoreCase(host, configured) == 0:
+        return true
+    return false
+
   if host in ["localhost", "127.0.0.1", "[::1]"]:
     return true
   if bindAddr.len > 0 and bindAddr notin ["0.0.0.0", "::"] and
       cmpIgnoreCase(host, bindAddr) == 0:
     return true
-  for configured in allowed:
-    if cmpIgnoreCase(host, configured) == 0:
-      return true
 
 # ------------------------------------------------------------------------------
 # Ignore all forwarded information unless the immediate TCP peer is trusted.

@@ -102,6 +102,20 @@ startup, because they would trust forwarding headers from arbitrary peers.
 An empty list trusts no forwarded headers; `/32` (IPv4) and `/128` (IPv6)
 select a single peer. Reverse proxies must discard or replace untrusted
 `Forwarded` and `X-Forwarded-*` headers before relaying requests.
+
+`allowedHosts` restricts which Host/forwarded host values may become
+`request.host` and appear in generated absolute URLs (`makeUri`). An empty
+list retains the local-development fallback: `localhost`, `127.0.0.1`,
+`[::1]`, and a non-wildcard bind address are eligible. A nonempty list is
+**exhaustive**: these local/bind hosts are not accepted implicitly and must
+be listed explicitly if needed. Matching is case-insensitive and compares
+hosts without their optional request port; the configured entries must not
+include ports. Unknown hosts produce an empty `request.host`, and `makeUri`
+falls back to a relative URL. This setting does **not** reject HTTP requests
+with an unlisted Host header; use an upstream virtual-host/access policy if
+request rejection is required. `publicBaseUrl`, when explicitly configured,
+still supplies the canonical application origin regardless of request Host or
+`allowedHosts` and should be treated as an independently trusted setting.
 The `managedSendTimeoutMs` default is 15000 ms (15 seconds) and bounds each
 transport-managed HTTP socket send; it does not time out an upgraded
 WebSocket session or a long-running route handler. See
