@@ -240,7 +240,10 @@ proc respond*(req: Request, code: HttpCode, content: string,
     msg.addInt(content.len)
     msg.add("\c\L")
   msg.add("\c\L")
-  msg.add(content)
+  # HEAD carries the metadata of the equivalent GET response, including its
+  # Content-Length, but no message body. This also applies to error pages.
+  if req.reqMethod != HttpHead:
+    msg.add(content)
   return req.client.send(msg)
 
 # ------------------------------------------------------------------------------
