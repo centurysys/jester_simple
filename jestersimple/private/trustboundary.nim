@@ -122,9 +122,23 @@ proc containsIp*(network, peer: string): bool =
     bits -= bitCount
   result = true
 
+# ------------------------------------------------------------------------------
+# Reject an unrestricted CIDR as a proxy trust rule, including zero-padded /0.
+# containsIp remains a general CIDR matcher: its /0 behavior is intentional.
+# ------------------------------------------------------------------------------
+proc isUnrestrictedProxyCidr(network: string): bool =
+  let slash = network.find('/')
+  if slash < 0 or slash + 1 >= network.len:
+    return false
+  for i in slash + 1 ..< network.len:
+    if network[i] != '0':
+      return false
+  result = true
+
 proc isTrustedPeer*(peer: string, trusted: openArray[string]): bool =
   for network in trusted:
-    if containsIp(network, peer):
+    # Settings are mutable: do not trust /0 even after post-startup changes.
+    if not isUnrestrictedProxyCidr(network) and containsIp(network, peer):
       return true
 
 proc validateOriginSettings*(settings: Settings) =
@@ -135,6 +149,9 @@ proc validateOriginSettings*(settings: Settings) =
       discard parseIpAddress(proxyAddress)
     except ValueError:
       raise newException(ValueError, "Invalid trusted proxy address")
+    if isUnrestrictedProxyCidr(network):
+      raise newException(ValueError,
+        "Unrestricted trusted proxy CIDR is not allowed")
     if not containsIp(network, proxyAddress):
       raise newException(ValueError, "Invalid trusted proxy CIDR")
   for host in settings.allowedHosts:

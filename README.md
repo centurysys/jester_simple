@@ -96,6 +96,12 @@ Use the `settings:` macro or `newSettings()` to configure `maxBody`,
 `bodyTimeoutMs`, `keepAliveTimeoutMs`, `managedSendTimeoutMs`,
 `trustedProxies`, `allowedHosts` and
 `publicBaseUrl`, in addition to the listen address, port and static directory.
+A `trustedProxies` entry must identify the actual reverse-proxy peer or a
+narrow CIDR. IPv4 and IPv6 `/0` networks (including `/00`) are rejected at
+startup, because they would trust forwarding headers from arbitrary peers.
+An empty list trusts no forwarded headers; `/32` (IPv4) and `/128` (IPv6)
+select a single peer. Reverse proxies must discard or replace untrusted
+`Forwarded` and `X-Forwarded-*` headers before relaying requests.
 The `managedSendTimeoutMs` default is 15000 ms (15 seconds) and bounds each
 transport-managed HTTP socket send; it does not time out an upgraded
 WebSocket session or a long-running route handler. See
