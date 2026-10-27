@@ -117,6 +117,15 @@ Static Range/If-Range (`206`) and chunk extensions are not implemented.
 Strict rejection of LF-only request line endings is not guaranteed. Do not
 interpret successful regression tests as a complete security audit.
 
+### Route pattern syntax errors
+
+The optional-character marker `?` must immediately follow a literal character
+(for example, `/report.?`). A leading `?` or a second `?` without an intervening
+literal is invalid. A backslash escapes `?`, `@`, or `\`; an incomplete trailing
+backslash or an escape before another character is invalid. Invalid patterns
+raise `ValueError` rather than triggering an out-of-bounds defect, including
+when parsed at compile time by a `router` macro.
+
 ## Configuration
 
 Use the `settings:` macro or `newSettings()` to configure `maxBody`,
