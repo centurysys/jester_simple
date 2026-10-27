@@ -206,3 +206,23 @@ HTTP Upgrade is excluded from the response-start deadline once begun.
 These limits govern network output and the response-start phase; they cannot
 preempt an indefinitely running application Future or guarantee RSS returns
 to the OS. See `docs/upgrade_contract.md` and `tests/http/run_js06.sh`.
+
+### JS-11: startup validation and descriptor admission
+
+`serve()` validates HTTP resource limits and proxy/origin settings before
+opening the listening socket. It snapshots the caller-provided `Settings` at
+startup, including independent copies of the proxy and host allowlists.
+Modifying the original Settings reference after `serve()` starts does not
+reconfigure running requests. Existing route APIs that explicitly modify
+`request.settings` (such as `setStaticDir`) still affect the live snapshot;
+application code must synchronize any such changes itself.
+
+An exception while deriving request origin metadata generates a fixed HTTP
+500 instead of escaping the HTTP callback. It does not echo untrusted host
+or forwarding fields. Configuration errors are server errors, not client 400s.
+
+FD headroom is checked before `accept()` by default (reserve: 5 descriptors),
+and again after accepting. A negative reserve is no longer a bypass. The
+check is a best-effort dispatcher descriptor heuristic, **not** a guarantee
+against a concurrent OS-level `EMFILE` / `ENFILE` failure. OS descriptor
+exhaustion and startup/listener failures still require operational monitoring.

@@ -425,7 +425,16 @@ proc handleRequestSlow(
 # Avoid logging or returning the invalid path as part of an error message.
 # ------------------------------------------------------------------------------
 proc handleRequest(jes: Jester, httpReq: NativeRequest): Future[void] =
-  var req = initRequest(httpReq, jes.settings)
+  var req: Request
+  try:
+    req = initRequest(httpReq, jes.settings)
+  except CatchableError:
+    # Origin metadata is derived during initialization. A configuration or
+    # parsing failure must not escape the callback and leave the peer hanging.
+    # Do not log the untrusted Host or forwarded header contents.
+    logging.error("Failed to initialize HTTP request metadata")
+    return httpReq.respond(Http500, errorpages.error($Http500, jesterVer),
+      newHttpHeaders(@({"Content-Type": "text/html;charset=utf-8"})))
   try:
     try:
       discard req.pathInfo
@@ -575,23 +584,27 @@ proc serve*(
     addHandler(logging.newConsoleLogger())
     setLogFilter(when defined(release): lvlInfo else: lvlDebug)
 
-  assert self.settings.staticDir.len > 0, "Static dir cannot be an empty string."
-  validateOriginSettings(self.settings)
+  # Preserve the pre-start configuration, but do not reuse the caller's
+  # mutable Settings reference as the live server configuration.
+  let activeSettings = snapshotSettings(self.settings)
+  validateServerSettings(activeSettings)
+  validateOriginSettings(activeSettings)
 
-  if self.settings.bindAddr.len > 0:
+  if activeSettings.bindAddr.len > 0:
     logging.info("Jester Simple listening at http://$1:$2$3" %
       [
-        self.settings.bindAddr, $self.settings.port, self.settings.appName
+        activeSettings.bindAddr, $activeSettings.port, activeSettings.appName
       ]
     )
   else:
     logging.info("Jester Simple listening at http://0.0.0.0:$1$2" %
-                 [$self.settings.port, self.settings.appName])
+                 [$activeSettings.port, activeSettings.appName])
 
   var jes = self
+  jes.settings = activeSettings
   let domain = block:
-    if self.settings.bindAddr != "":
-      let ip = self.settings.bindAddr.parseIpAddress()
+    if activeSettings.bindAddr != "":
+      let ip = activeSettings.bindAddr.parseIpAddress()
       if ip.family == IPv4:
         AF_INET
       else:
@@ -599,25 +612,25 @@ proc serve*(
     else:
       AF_INET
   self.httpServer = newAsyncHttpServer(
-    reusePort = self.settings.reusePort,
-    maxBody = self.settings.maxBody,
-    maxConnections = self.settings.maxConnections,
-    maxHeaderBytes = self.settings.maxHeaderBytes,
-    maxHeaderFields = self.settings.maxHeaderFields,
-    headerTimeoutMs = self.settings.headerTimeoutMs,
-    bodyTimeoutMs = self.settings.bodyTimeoutMs,
-    keepAliveTimeoutMs = self.settings.keepAliveTimeoutMs,
-    managedSendTimeoutMs = self.settings.managedSendTimeoutMs,
-    responseStartTimeoutMs = self.settings.responseStartTimeoutMs,
-    streamTotalTimeoutMs = self.settings.streamTotalTimeoutMs
+    reusePort = activeSettings.reusePort,
+    maxBody = activeSettings.maxBody,
+    maxConnections = activeSettings.maxConnections,
+    maxHeaderBytes = activeSettings.maxHeaderBytes,
+    maxHeaderFields = activeSettings.maxHeaderFields,
+    headerTimeoutMs = activeSettings.headerTimeoutMs,
+    bodyTimeoutMs = activeSettings.bodyTimeoutMs,
+    keepAliveTimeoutMs = activeSettings.keepAliveTimeoutMs,
+    managedSendTimeoutMs = activeSettings.managedSendTimeoutMs,
+    responseStartTimeoutMs = activeSettings.responseStartTimeoutMs,
+    streamTotalTimeoutMs = activeSettings.streamTotalTimeoutMs
   )
   let serveFut = self.httpServer.serve(
-    self.settings.port,
+    activeSettings.port,
     proc (req: httptransport.Request): Future[void] {.gcsafe, closure.} =
       result = handleRequest(jes, req),
-    self.settings.bindAddr, domain = domain)
-  if not self.settings.futureErrorHandler.isNil:
-    serveFut.callback = self.settings.futureErrorHandler
+    activeSettings.bindAddr, domain = domain)
+  if not activeSettings.futureErrorHandler.isNil:
+    serveFut.callback = activeSettings.futureErrorHandler
   else:
     asyncCheck serveFut
   runForever()

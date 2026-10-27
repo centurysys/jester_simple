@@ -831,10 +831,15 @@ proc listen*(server: AsyncHttpServer, port: Port, address = "",
   server.socket.bindAddr(port, address)
   server.socket.listen()
 
+proc hasDescriptorHeadroom*(active, limit, reserve: int): bool {.inline.} =
+  # A negative reserve is not a way to turn off the admission check.
+  let needed = (if reserve < 0: 5 else: reserve)
+  result = active >= 0 and active < limit and needed < limit - active
+
 proc shouldAcceptRequest*(server: AsyncHttpServer,
                           assumedDescriptorsPerRequest = 5): bool {.inline.} =
-  result = assumedDescriptorsPerRequest < 0 or
-    (activeDescriptors() + assumedDescriptorsPerRequest < server.maxFDs)
+  hasDescriptorHeadroom(activeDescriptors(), server.maxFDs,
+                        assumedDescriptorsPerRequest)
 
 proc dispatchClient(
     server: AsyncHttpServer, client: AsyncSocket, address: string,
@@ -858,7 +863,7 @@ proc acceptRequest*(
 
 proc serve*(server: AsyncHttpServer, port: Port,
             callback: proc(request: Request): Future[void] {.closure, gcsafe.},
-            address = "", assumedDescriptorsPerRequest = -1,
+            address = "", assumedDescriptorsPerRequest = 5,
             domain = AF_INET) {.async.} =
   listen(server, port, address, domain)
   while true:
