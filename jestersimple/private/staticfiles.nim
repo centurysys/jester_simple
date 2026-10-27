@@ -171,6 +171,15 @@ proc openConfinedStatic*(root, encodedPath: string): StaticOpen =
     result.status = Http400
     return
 
+  # URL-derived leading-dot components are private by default, including
+  # percent-encoded names and hidden directories anywhere below staticDir.
+  # Return 404 to avoid disclosing whether the hidden entry exists.
+  # This policy applies only to automatic static URL resolution: explicit
+  # sendFile paths are selected by the application and remain unrestricted.
+  for segment in parts:
+    if segment.len > 0 and segment[0] == '.':
+      return
+
   var current = posix.open(root.cstring,
     O_RDONLY or O_CLOEXEC or LinuxNoFollow or LinuxDirectory)
   if current < 0:

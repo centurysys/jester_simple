@@ -75,8 +75,11 @@ populate it only if static file hosting is needed.
 - Response header and cookie validation guards against CR/LF injection;
   unhandled exception pages do not disclose exception details.
 - Static file access uses Linux directory-relative descriptors and does not
-  follow symlinks under `staticDir`. GET, HEAD and conditional ETag/304
-  responses are supported. Weak ETags are derived from file metadata.
+  follow symlinks under `staticDir`. Automatic static URL lookup returns 404
+  for hidden filename components beginning with `.` (for example `.env`,
+  `.git/config`, `sub/.config` and `.well-known/`). GET, HEAD and conditional
+  ETag/304 responses are supported for public files. Weak ETags are derived
+  from file metadata.
 - Static files are transferred in bounded 16 KiB blocks. The response header
   and initial body block are combined to avoid unnecessary TCP delays for
   small files. Asynchronous raw streams should await `request.sendAsync()`.
@@ -84,6 +87,31 @@ populate it only if static file hosting is needed.
 The framework **does not** provide TLS termination, login/authentication,
 application authorization, session management or CSRF protection. Those
 remain the application's and deployment's responsibility.
+
+### Static content and explicit file responses
+
+`staticDir` is a **public document root**, not a safe place to store secrets.
+Automatic GET/HEAD static lookup refuses hidden filename components starting
+with a period, including percent-encoded leading periods, and responds with
+404 even if the entry exists. The special traversal segments `.` and `..`
+remain invalid paths (HTTP 400). Hidden directories are blocked at every depth. Ordinary
+files with backup-like extensions (`.bak`, `.old`, etc.) are **not** blocked;
+filename-extension blacklists are not a reliable security boundary. Store
+configuration files, credentials, backups and private data outside `staticDir`.
+
+This default also excludes `/.well-known/`. Serve ACME HTTP-01 challenges or
+other deliberately public dot directories through a dedicated reverse-proxy
+location or explicit application route, subject to application authorization.
+There is no global "allow all dotfiles" switch.
+
+`sendFile(filename)` has a **different trust contract**: the application
+selects a filesystem pathname and may intentionally send files outside
+`staticDir`, including dotfiles. `sendFile` is **not** confined by the static
+URL policy; it does retain regular-file/permission checks, pinned-FD reads and
+streaming. Never derive its pathname from untrusted URL/query parameters by
+concatenation. If a route needs to serve client-selected files, use an explicit
+allowlist or a separate confined file-selection mechanism. This step does not
+introduce a new `sendFileUnder` API or alter existing explicit-file behavior.
 
 Static Range/If-Range (`206`) and chunk extensions are not implemented.
 Strict rejection of LF-only request line endings is not guaranteed. Do not
