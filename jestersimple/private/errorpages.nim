@@ -24,7 +24,7 @@ func error*(err, jesterVer: string): string =
   return html(head(title(status)),
               body(h1(status),
                    "<hr/>",
-                   p("Jester " & escapeHtml(jesterVer)),
+                   p("Jester Simple " & escapeHtml(jesterVer)),
                    style = "text-align: center;"),
               xmlns = "http://www.w3.org/1999/xhtml")
 
@@ -33,8 +33,8 @@ func error*(err, jesterVer: string): string =
 # Production error handling does not pass private exception details here.
 # ------------------------------------------------------------------------------
 func routeException*(detail, jesterVer: string): string =
-  return html(head(title("Jester route exception")),
+  return html(head(title("Jester Simple route exception")),
               body(h1("An error occurred in one of your routes."),
                    p(b("Detail: "), escapeHtml(detail)),
-                   p("Jester " & escapeHtml(jesterVer))),
+                   p("Jester Simple " & escapeHtml(jesterVer))),
               xmlns = "http://www.w3.org/1999/xhtml")

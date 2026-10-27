@@ -1,2 +1,0 @@
-   text	   data	    bss	    dec	    hex	filename
- 494355	  44064	  11400	 549819	  863bb	/tmp/tmp.tgcTP8VkYO/step17-current

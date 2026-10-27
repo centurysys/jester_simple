@@ -1,14 +1,11 @@
-# Package
-
-version       = "1.0.0" # Be sure to update jester.jesterVer too!
-author        = "Dominik Picheta"
-description   = "A sinatra-like web framework for Nim."
+# Jester Simple package metadata; keep version in sync with jestersimple.nim.
+version       = "1.0.0"
+author        = "Dominik Picheta and contributors"
+description   = "Lightweight, security-hardened Nim HTTP framework for embedded Linux."
 license       = "MIT"
 
-skipFiles = @["todo.markdown"]
+# Exclude test sources from an installed Nimble package.
 skipDirs = @["tests"]
-
-# Deps
 
 requires "nim >= 2.2.12"
 

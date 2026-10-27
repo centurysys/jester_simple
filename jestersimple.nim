@@ -567,13 +567,13 @@ proc serve*(
   validateOriginSettings(self.settings)
 
   if self.settings.bindAddr.len > 0:
-    logging.info("Jester is making jokes at http://$1:$2$3" %
+    logging.info("Jester Simple listening at http://$1:$2$3" %
       [
         self.settings.bindAddr, $self.settings.port, self.settings.appName
       ]
     )
   else:
-    logging.info("Jester is making jokes at http://0.0.0.0:$1$2" %
+    logging.info("Jester Simple listening at http://0.0.0.0:$1$2" %
                  [$self.settings.port, self.settings.appName])
 
   var jes = self
@@ -770,7 +770,7 @@ template `@`*(s: string): untyped =
     ""
 
 proc setStaticDir*(request: Request, dir: string) =
-  ## Sets the directory in which Jester will look for static files. It is
+  ## Sets the directory in which Jester Simple looks for static files. It is
   ## ``./public`` by default.
   ##
   ## The files will be served like so:
@@ -781,7 +781,7 @@ proc setStaticDir*(request: Request, dir: string) =
   request.settings.staticDir = dir
 
 proc getStaticDir*(request: Request): string =
-  ## Gets the directory in which Jester will look for static files.
+  ## Gets the directory in which Jester Simple looks for static files.
   ##
   ## ``./public`` by default.
   return request.settings.staticDir

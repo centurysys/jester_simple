@@ -1,58 +1,56 @@
-# Jester Simple 初回リリース判定 — チェックリスト
+# Jester Simple 初回リリース判定チェックリスト
 
-状態：**未判定 / NO-GO（証跡未収集）**。このチェックリストは自動合格ではない。
-記入時には測定日・ターゲット・Git HEAD・参照ファイルを残す。
+状態：**未判定**。GitHubへのソース公開と正式リリース承認は別。
+測定日・ターゲット・Git HEAD・参照ログを記入してからタグを確定する。
 
-## 1. テストと実機
+## テスト・性能・移植確認
 
 - [ ] `nimble test -y`が現行HEADでPASS。ログ：
 - [ ] Step 5〜15の回帰試験がすべてPASS。ログ：
 - [ ] Step 16のDebug/Releaseが各23/23 PASS。ログ：
-- [ ] Step 17 Python単体テストがPASS。ログ：
-- [ ] amd64で`--mm:orc -d:release --opt:size`の結果を保存。パス：
-- [ ] arm64実機（対象がある場合）で測定。機種／結果：
-- [ ] armhf Cortex-A5実機で測定。CPU／クロック／RAM／結果：
-- [ ] 旧Jesterforkと同条件で比較（不可能なら理由を記録）。結果：
-- [ ] 代表管理WebUIを1つ移植し、HTTP機能と常時運用を確認。対象／結果：
-- [ ] fd/RSS/CPUに用途上の許容不能な増大がない。上限／測定：
-- [ ] 起動バイナリサイズ／動的依存を確認。結果：
+- [ ] `python3 tests/perf/test_step17_tools.py`がPASS。ログ：
+- [ ] 静的小ファイル最適化後のStep 13/14/16回帰がPASS。ログ：
+- [ ] amd64で`--mm:orc -d:release --opt:size`の性能・RSSを記録。パス：
+- [ ] 対象がある場合arm64実機で測定。機種・結果：
+- [ ] armhf/Cortex-A5実機で測定。CPU・RAM・結果：
+- [ ] 旧Jesterforkとの比較条件・RPS退行の受け入れ判断を記録。結果：
+- [ ] 代表管理WebUIを移植し、実機でHTTP正常系・異常系を確認。対象・結果：
+- [ ] RSS・FD・CPU・バイナリサイズ・依存ライブラリを用途の上限と比較。結果：
 
-## 2. 出荷阻害のセキュリティ項目
+## セキュリティと導入時の責任分界
 
-- [ ] CL/TE、重複CL、chunked累積サイズ、malformed chunkの検査が有効。
-- [ ] 接続上限、ヘッダー制限、受信タイムアウトを対象機の負荷条件で確認。
-- [ ] 例外メッセージ、ソースパス、スタックトレースが外部応答に漏れない。
-- [ ] 応答ヘッダー、Set-Cookie、LocationにCRLF注入できない。
-- [ ] Host/Forwardedの信頼設定とリバースプロキシ設定が一致している。
-- [ ] malformed multipartでプロセス異常終了や入力漏洩を起こさない。
-- [ ] 静的ファイルのtraversal、symlink、競合アクセスが遮断される。
-- [ ] raw/大容量送信の途中切断後にプロセスが生存し、FDリークがない。
-- [ ] HTTPS/TLS終端、ログイン認証、ネットワークACLは利用アプリ側で確保。
+- [ ] CL/TE、重複CL、chunked累積サイズ、不正chunkを拒否できる。
+- [ ] 接続・ヘッダー・受信タイムアウトを対象機の負荷条件で確認。
+- [ ] HTTPエラーに内部例外メッセージやスタックトレースが漏れない。
+- [ ] ヘッダー、Set-Cookie、LocationにCRLF注入できない。
+- [ ] Host/Forwardedの信頼設定と実際のプロキシ構成が一致している。
+- [ ] malformed multipartでプロセス終了や情報漏洩が起きない。
+- [ ] 静的ファイルのtraversal、symlink、パス置換競合への防御を確認。
+- [ ] raw/大容量送信の途中切断後のFD回収と接続処理を確認。
+- [ ] TLS、認証・認可、CSRF対策、ネットワークACLをアプリ・運用側で確保。
 
-## 3. 既知の制限・サポート範囲
+## 既知の制限
 
-- Linux専用。Nim 2.2.12以上、ORC。単一の`asyncdispatch`ベースHTTP受信層。
-- `-d:useStdLib`は旧版バックエンド選択として無効。HTTPBeast互換なし。
-- 既定では転送ヘッダーを信頼しない。必要な場合のみ`trustedProxies`設定。
-- `chunk extension`は未サポート（400拒否）。
-- 静的ファイルの`Range`/`If-Range`による部分応答は未実装。
-- LF-only行終端に関する厳密な拒否は現受信方式では保証していない。
-- 静的ファイル公開ディレクトリ内のsymlinkは拒否する。
-- HTTPサーバは認証/認可、セッション、CSRF対策、TLS終端を内蔵しない。
-- 入力検証・回帰試験の成功は第三者監査やfuzzingの代替にならない。
+- Linuxのみ。Nim 2.2.12以降とORCを使用し、HTTPBeastは含めない。
+- 既定では転送ヘッダーを信頼しない。必要な場合のみ`trustedProxies`を設定。
+- `chunk extension`、静的`Range`/`If-Range`による206は未対応。
+- LF-only行終端に関する厳密な拒否は保証していない。
+- 静的公開ディレクトリ内のsymlinkは禁止。
+- 認証・認可、セッション、CSRF、TLS終端はフレームワーク外。
+- 回帰試験成功は第三者監査やファジングの代わりにはならない。
 
-## 4. リリース作業
+## 公開・バージョン管理
 
-- [ ] API移行表と例外・転送・Cookie・静的配信の非互換変更をレビュー。
-- [ ] READMEをレビュー、旧説明の不整合がない。
-- [ ] 既存`license.txt`および第三者著作権表示を確認。
-- [ ] `jestersimple.nimble`のバージョンと`jesterVer`の一致を確認。
-- [ ] `changelog.markdown`と変更点ドラフトを統合。
-- [ ] 配布ファイルにテストログ・バイナリ・秘密情報・ローカルパスが混入していない。
-- [ ] 最終HEADでLinux CIを確認し、タグ名を決める。
+- [ ] [移行ガイド](../migration/jesterfork_to_jestersimple.md)と非互換変更を確認。
+- [ ] [`README.md`](../../README.md)、[`CHANGELOG.md`](../../CHANGELOG.md)を確認。
+- [ ] 旧Jester/Jesterforkの著作権表記と`license.txt`を保持。
+- [ ] `jestersimple.nimble`と`jestersimple.nim`のバージョン一致を確認。
+- [ ] 配布物に不要な測定ログ・ビルド済みバイナリ・秘密情報がない。
+- [ ] GitHub Actionsは利用しない方針。ローカルの全回帰テスト結果を記録。
+- [ ] 正式リリースに採用するバージョンとタグ名を確定。
 
-**最終判定：** 未判定。責任者：＿＿＿＿ 日付：＿＿＿＿
+**最終判定：** 未判定。責任者：＿＿＿＿　日付：＿＿＿＿
 
 **未対応事項／受け入れ判断：**
 
-- （証拠を記入）
+- （証跡を記入）

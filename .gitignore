@@ -1,8 +1,22 @@
-/tests/*
-!/tests/*.nim
-!/tests/*/
-!/tests/nim-in-action-code/*
+# Nim build artefacts
+nimcache/
+*.exe
+
+# Python test tooling
+__pycache__/
+*.py[cod]
+
+# Generated test and benchmark reports
+/docs/modernization/
+/docs/baseline/
+/docs/performance/step17-*/
+
+# Legacy sample's compiled executable (source remains in the test tree)
 /tests/nim-in-action-code/Chapter7/Tweeter/src/tweeter
 
-nimcache
-__pycache__
+# Nim test executables
+/tests/alltest
+/tests/customRouter
+/tests/issue150
+/tests/issue247
+/tests/tester
