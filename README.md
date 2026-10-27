@@ -93,8 +93,13 @@ interpret successful regression tests as a complete security audit.
 
 Use the `settings:` macro or `newSettings()` to configure `maxBody`,
 `maxConnections`, `maxHeaderBytes`, `maxHeaderFields`, `headerTimeoutMs`,
-`bodyTimeoutMs`, `keepAliveTimeoutMs`, `trustedProxies`, `allowedHosts` and
+`bodyTimeoutMs`, `keepAliveTimeoutMs`, `managedSendTimeoutMs`,
+`trustedProxies`, `allowedHosts` and
 `publicBaseUrl`, in addition to the listen address, port and static directory.
+The `managedSendTimeoutMs` default is 15000 ms (15 seconds) and bounds each
+transport-managed HTTP socket send; it does not time out an upgraded
+WebSocket session or a long-running route handler. See
+[HTTP Upgrade contract](docs/upgrade_contract.md) for exact scope.
 Choose values based on the target device's memory and CPU budget.
 
 ## Tests and performance measurements

@@ -474,7 +474,7 @@ proc newSettings*(
   futureErrorHandler: proc (fut: Future[void]) {.closure, gcsafe.} = nil,
   maxConnections = 64, maxHeaderBytes = 16384, maxHeaderFields = 100,
   headerTimeoutMs = 5000, bodyTimeoutMs = 15000,
-  keepAliveTimeoutMs = 5000,
+  keepAliveTimeoutMs = 5000, managedSendTimeoutMs = 15000,
   trustedProxies: seq[string] = @[],
   allowedHosts: seq[string] = @[],
   publicBaseUrl = ""
@@ -492,6 +492,7 @@ proc newSettings*(
     headerTimeoutMs: headerTimeoutMs,
     bodyTimeoutMs: bodyTimeoutMs,
     keepAliveTimeoutMs: keepAliveTimeoutMs,
+    managedSendTimeoutMs: managedSendTimeoutMs,
     trustedProxies: trustedProxies,
     allowedHosts: allowedHosts,
     publicBaseUrl: publicBaseUrl,
@@ -602,7 +603,8 @@ proc serve*(
     maxHeaderFields = self.settings.maxHeaderFields,
     headerTimeoutMs = self.settings.headerTimeoutMs,
     bodyTimeoutMs = self.settings.bodyTimeoutMs,
-    keepAliveTimeoutMs = self.settings.keepAliveTimeoutMs
+    keepAliveTimeoutMs = self.settings.keepAliveTimeoutMs,
+    managedSendTimeoutMs = self.settings.managedSendTimeoutMs
   )
   let serveFut = self.httpServer.serve(
     self.settings.port,

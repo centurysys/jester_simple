@@ -19,6 +19,7 @@ type
     headerTimeoutMs*: int
     bodyTimeoutMs*: int
     keepAliveTimeoutMs*: int
+    managedSendTimeoutMs*: int
     trustedProxies*: seq[string]
     allowedHosts*: seq[string]
     publicBaseUrl*: string

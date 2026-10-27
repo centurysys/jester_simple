@@ -49,3 +49,26 @@ On HTTP/1.1, a `close` token overrides other tokens; on HTTP/1.0, an explicit
 JS-05/06 will introduce deadlines for ordinary HTTP output without applying
 short-lived HTTP response deadlines to upgraded sessions. WebSocket handshake
 rules, frame validation and ping/idle timeouts belong in `ws`.
+
+## Managed send deadline (JS-05)
+
+Jester Simple now applies `managedSendTimeoutMs` (default `15000`) to each
+transport-managed socket send: `respond`, `respondHeaders` (including its
+optional first body chunk), and the native `sendHeaders`. A timeout or socket
+error closes the transport-owned connection; the route cannot write a second
+HTTP error response after sending has started. The timeout is configured using
+`settings:` or `newSettings(managedSendTimeoutMs = ...)`. Values below 1 ms
+are clamped to 1 ms by the transport; disabling this limit is not supported.
+
+The timeout is **not** a whole-request or whole-response deadline. It does not
+cover route computation, queued raw writes (which have their own limit), or
+subsequent direct socket writes by static-file streaming code. Those operations
+are examined separately in JS-06. `withTimeout` does not cancel a pending
+`AsyncSocket.send` Future, so timeout handling closes the socket rather than
+waiting indefinitely for that Future. A pending send may retain its message
+buffer until the async runtime releases it; resource tests must distinguish
+high-water RSS from leaked connections.
+
+An explicitly upgraded connection does not enter any Managed response path, so
+this deadline cannot terminate a valid long-lived upgraded session. WebSocket
+handshake/frame and idle/heartbeat policies belong to the protocol adapter.

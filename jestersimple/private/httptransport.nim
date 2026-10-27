@@ -48,6 +48,7 @@ type
     headerTimeoutMs: int
     bodyTimeoutMs: int
     keepAliveTimeoutMs: int
+    managedSendTimeoutMs: int
 
   ConnectionWatch = ref object
     client: AsyncSocket
@@ -68,6 +69,7 @@ type
     started: bool
     queuedBytes: int
     queuedWrites: int
+    managedSendTimeoutMs: int
 
 # ------------------------------------------------------------------------------
 # API: Return the bound port (including an automatically assigned port).
@@ -82,7 +84,8 @@ proc newAsyncHttpServer*(reuseAddr = true, reusePort = false,
                          maxBody = 8388608, maxConnections = 64,
                          maxHeaderBytes = 16384, maxHeaderFields = 100,
                          headerTimeoutMs = 5000, bodyTimeoutMs = 15000,
-                         keepAliveTimeoutMs = 5000): AsyncHttpServer =
+                         keepAliveTimeoutMs = 5000,
+                         managedSendTimeoutMs = 15000): AsyncHttpServer =
   AsyncHttpServer(
     reuseAddr: reuseAddr, reusePort: reusePort,
     maxBody: max(0, maxBody),
@@ -91,7 +94,8 @@ proc newAsyncHttpServer*(reuseAddr = true, reusePort = false,
     maxHeaderFields: max(1, maxHeaderFields),
     headerTimeoutMs: max(1, headerTimeoutMs),
     bodyTimeoutMs: max(1, bodyTimeoutMs),
-    keepAliveTimeoutMs: max(1, keepAliveTimeoutMs)
+    keepAliveTimeoutMs: max(1, keepAliveTimeoutMs),
+    managedSendTimeoutMs: max(1, managedSendTimeoutMs)
   )
 
 # ------------------------------------------------------------------------------
@@ -245,6 +249,25 @@ proc drainRawWrites(req: Request): Future[bool] {.async.} =
   return not req.rawWrites.failed
 
 # ------------------------------------------------------------------------------
+# API: Enforce a deadline for each transport-managed HTTP socket send.
+# withTimeout does not cancel the underlying send Future. On expiry, close the
+# transport-owned socket and do not await a possibly stuck send indefinitely.
+# This does not apply to upgraded connections or directly streamed body chunks.
+# ------------------------------------------------------------------------------
+proc sendManagedTimed(req: Request, payload: string): Future[void] {.async.} =
+  let state = req.rawWrites
+  try:
+    let sending = state.client.send(payload)
+    if not (await withTimeout(sending, state.managedSendTimeoutMs)):
+      raise newException(IOError, "Managed HTTP send timed out")
+    await sending
+  except CatchableError:
+    state.failed = true
+    if not state.client.isClosed:
+      state.client.close()
+    raise
+
+# ------------------------------------------------------------------------------
 # API: Write response headers using the upstream transport format.
 # ------------------------------------------------------------------------------
 proc addHeaders(msg: var string, headers: HttpHeaders) =
@@ -256,7 +279,7 @@ proc sendHeaders*(req: Request, headers: HttpHeaders): Future[void] =
   req.beginManagedResponse()
   var msg = ""
   msg.addHeaders(headers)
-  return req.client.send(msg)
+  return req.sendManagedTimed(msg)
 
 # ------------------------------------------------------------------------------
 # Send a header-only prefix for a file streamed in subsequent writes.
@@ -276,7 +299,7 @@ proc respondHeaders*(req: Request, code: HttpCode,
     msg.addHeaders(headers)
   msg.add("\c\L")
   msg.add(firstBodyChunk)
-  return req.client.send(msg)
+  return req.sendManagedTimed(msg)
 
 proc respond*(req: Request, code: HttpCode, content: string,
               headers: HttpHeaders = nil): Future[void] =
@@ -294,7 +317,7 @@ proc respond*(req: Request, code: HttpCode, content: string,
   # Content-Length, but no message body. This also applies to error pages.
   if req.reqMethod != HttpHead:
     msg.add(content)
-  return req.client.send(msg)
+  return req.sendManagedTimed(msg)
 
 # ------------------------------------------------------------------------------
 # API: Parse HTTP protocol tokens as done by the upstream server.
@@ -482,7 +505,8 @@ proc processRequest(
   else:
     request.hostname.shallowCopy(address)
   request.client = client
-  request.rawWrites = RawWriteState(client: client)
+  request.rawWrites = RawWriteState(
+    client: client, managedSendTimeoutMs: server.managedSendTimeoutMs)
 
   # Include request line and blank lines in the aggregate header budget.
   var headerBytes = 0
