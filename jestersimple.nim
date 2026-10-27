@@ -1216,7 +1216,7 @@ proc processRoutesBody(
           error("Expected identifier.", extend[1])
 
         let prefix =
-          if extend.len > 1:
+          if extend.len > 2:
             extend[2].strVal
           else:
             ""

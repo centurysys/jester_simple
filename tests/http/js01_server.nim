@@ -71,8 +71,8 @@ router primary:
 when defined(js01Async):
   router asyncPrimary:
     {.async.}
-    # Explicit empty prefix avoids the existing two-argument extend macro defect.
-    extend primary, ""
+    # No prefix is the normal two-element extend form.
+    extend primary
 
   var app = initJester(asyncPrimary, settings)
 elif defined(js01Multi):
