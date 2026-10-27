@@ -38,8 +38,14 @@ interceptable; an adapter must use the reserved socket responsibly.
 
 ## Remaining verification
 
-JS-04 will test the full lifetime, correct parsing of `Connection` tokens,
-connection-slot reclamation and interactions with the final socket close.
+JS-04 verifies route-owned session lifetime, Connection token parsing,
+connection-slot reclamation, and final socket close. The transport recognizes
+`Connection` options as complete comma-separated tokens (ASCII case insensitive),
+not substrings. A client sending `Connection: Upgrade` does not by itself
+activate an upgraded protocol: only `beginUpgrade()` does. An unaccepted Upgrade
+request can receive an ordinary HTTP response and retain HTTP/1.1 keep-alive.
+On HTTP/1.1, a `close` token overrides other tokens; on HTTP/1.0, an explicit
+`keep-alive` token is required and `close` still takes precedence.
 JS-05/06 will introduce deadlines for ordinary HTTP output without applying
 short-lived HTTP response deadlines to upgraded sessions. WebSocket handshake
 rules, frame validation and ping/idle timeouts belong in `ws`.

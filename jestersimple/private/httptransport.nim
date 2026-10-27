@@ -373,6 +373,43 @@ proc parseChunkLength(line: string, length: var int): bool =
   return true
 
 # ------------------------------------------------------------------------------
+# API: Match a complete, case-insensitive Connection header token.
+# Comma-separated tokens may be surrounded by SP / HTAB. Work on the original
+# string to avoid allocating a seq (or substrings) for each keep-alive request.
+# A protocol switch still requires beginUpgrade; a client-supplied token alone
+# cannot transfer ownership of the connection.
+# ------------------------------------------------------------------------------
+proc hasConnectionToken*(value, token: string): bool =
+  if token.len == 0:
+    return false
+
+  var start = 0
+  while start < value.len:
+    var finish = start
+    while finish < value.len and value[finish] != ',':
+      inc finish
+
+    var first = start
+    var last = finish
+    while first < last and value[first] in {' ', '\t'}:
+      inc first
+    while last > first and value[last - 1] in {' ', '\t'}:
+      dec last
+
+    if last - first == token.len:
+      var matches = true
+      for i in 0 ..< token.len:
+        if toLowerAscii(value[first + i]) != toLowerAscii(token[i]):
+          matches = false
+          break
+      if matches:
+        return true
+
+    start = finish + 1
+
+  return false
+
+# ------------------------------------------------------------------------------
 # API: Read exactly n bytes or return a shorter value on disconnect.
 # ------------------------------------------------------------------------------
 proc recvExact(client: AsyncSocket, n: int): Future[string] {.async.} =
@@ -617,13 +654,18 @@ proc processRequest(
   if request.upgradeStarted:
     return false
 
-  if "upgrade" in request.headers.getOrDefault("connection"):
-    return false
-  if (request.protocol == HttpVer11 and
-      cmpIgnoreCase(request.headers.getOrDefault("connection"), "close") != 0) or
-     (request.protocol == HttpVer10 and
-      cmpIgnoreCase(request.headers.getOrDefault("connection"), "keep-alive") == 0):
-    return true
+  # Connection is a comma-separated list of case-insensitive tokens.
+  # Do not treat an unaccepted Upgrade offer as a completed Upgrade.  The
+  # explicit omUpgraded state above is the only protocol-switch indicator.
+  let connection = request.headers.getOrDefault("connection")
+  if request.protocol == HttpVer11:
+    if not hasConnectionToken(connection, "close"):
+      return true
+  elif request.protocol == HttpVer10:
+    if hasConnectionToken(connection, "keep-alive") and
+        not hasConnectionToken(connection, "close"):
+      return true
+
   request.client.close()
   return false
 
