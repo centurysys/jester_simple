@@ -1,6 +1,6 @@
 import asyncdispatch, times
 
-import jesterfork
+import jestersimple
 
 import database, views/user, views/general
 

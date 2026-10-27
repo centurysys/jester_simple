@@ -1,0 +1,17 @@
+# Step 9 request origin trust fixture (loopback only).
+import std/net
+import jestersimple
+
+settings:
+  port = Port(5487)
+  bindAddr = "127.0.0.1"
+  
+routes:
+  get "/inspect":
+    let current = request.ip & "|" & $request.secure & "|" &
+      request.host & "|" & $request.port & "|" &
+      request.makeUri("/next")
+    resp current
+
+  get "/ping":
+    resp "pong"

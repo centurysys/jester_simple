@@ -1,6 +1,10 @@
+# This module is loaded for the compile-time router registration side effect.
+# Suppress only the unused-import diagnostic for this module's importers.
+{.used.}
+
 import re
 
-import jesterfork
+import jestersimple
 
 router external:
   get "/simple":

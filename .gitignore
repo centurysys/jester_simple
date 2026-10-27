@@ -5,3 +5,4 @@
 /tests/nim-in-action-code/Chapter7/Tweeter/src/tweeter
 
 nimcache
+__pycache__

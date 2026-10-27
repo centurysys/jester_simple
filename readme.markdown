@@ -1,232 +1,87 @@
-# FORK OF Jester
+# Jester Simple
 
-A fork of `jester` updated to work with Nim version 2.0.
-Package has been renamed to `jesterfork`.
+Jester Simple is a compact **Linux-only** Nim HTTP routing framework derived
+from Jester/Jesterfork. It targets embedded management Web UIs and applications
+that benefit from asynchronous I/O without a separate threaded HTTP backend.
 
-**Reason:**
-* Pull requests not being merged (or closed) in main repo
-* Dependency to `httpbeast` does not support Nim 2.0
-* Full support for Nim 2.0
+## Requirements
 
-**Jester & httpbeast:**
-* To use this package with `httpbeast`, you need the fork [`httpbeastfork`](https://github.com/ThomasTJdev/httpbeast_fork).
+- Linux (amd64, arm64, armhf where supported by the Nim toolchain).
+- Nim **2.2.12 or newer**, built with `--mm:orc`.
+- `asyncdispatch` and the internal HTTP transport. HTTPBeast is **not** used.
+- A C toolchain appropriate for the target Linux platform.
 
-**Breaking changes / Info:**
-* The minimum Nim version this fork supports is 1.6.18. Test are done with Nim 1.6.18 and stable (2.x.x) versions.
-* Support for `httpbeast` is dropped. Use [`httpbeastfork`](https://github.com/ThomasTJdev/httpbeast_fork).
-* Various pull requests from the main repo has been merged into this fork.
+The bundled regression suite is built with Nim 2.2.12. Other Nim versions and
+embedded targets require independent verification before deployment.
 
-
-# 🃏 Jester 🃏
-
-The sinatra-like web framework for Nim. Jester provides a DSL for quickly
-creating web applications in Nim.
+## Minimal application
 
 ```nim
-# example.nim
-import htmlgen
-import jesterfork
+import jestersimple
 
 routes:
   get "/":
-    resp h1("Hello world")
+    resp "Hello world"
 ```
 
-Compile and run with:
+Build with `nim c --mm:orc -d:release --opt:size app.nim`.
+By default the server listens on port 5000. Restrict network exposure and
+set `bindAddr`, authentication and TLS termination in your deployment plan.
 
-```
-  cd tests/example
-  nim c -r example.nim
-```
+The `settings` macro can configure `maxBody`, `maxConnections`,
+`maxHeaderBytes`, `maxHeaderFields`, `headerTimeoutMs`, `bodyTimeoutMs`,
+`keepAliveTimeoutMs`, `trustedProxies`, `allowedHosts`, and `publicBaseUrl`.
+The defaults are conservative starting points; they are not sufficient for
+every network threat model or workload.
 
-View at: [localhost:5000](http://localhost:5000)
+## HTTP and trust boundaries
 
-Before deploying to production ensure you run your application behind a reverse proxy. This library is not yet hardened against HTTP security exploits so applications written in it should not be exposed to the public internet.
+- Body size limits are enforced for Content-Length and chunked inputs.
+- Ambiguous HTTP framing, malformed multipart, invalid Host and output headers
+  are rejected.
+- `request.ip` uses the TCP peer by default. Forwarding metadata is considered
+  only for trusted proxy peers. Proxies must overwrite untrusted headers.
+- Static files are served from verified Linux file descriptors. Symlinks under
+  the public directory are not followed.
+- Large responses use bounded streaming. Raw streaming users should await
+  `request.sendAsync()` to manage backpressure.
+- The framework does **not** supply TLS, login/authentication, session
+  management, CSRF protection or application-specific authorization.
 
-## Routes
+When reachable by untrusted networks, use a properly configured reverse proxy,
+TLS, ACLs, suitable monitoring, and application authentication. Review the
+known protocol limitations in the release checklist before production use.
 
-```nim
-routes:
-  get "/":
-    # do something here.
-```
+## Testing and performance
 
-All routes must be inside a ``routes`` block.
-
-Routes will be executed in the order that they are declared. So be careful when
-halting.
-
-The route path may contain a special pattern or just a static string. Special
-patterns are almost identical to Sinatra's, the only real difference is the
-use of ``@`` instead of the ``:``.
-
-```nim
-get "/hello/@name":
-  # This matches "/hello/fred" and "/hello/bob".
-  # In the route ``@"name"`` will be either "fred" or "bob".
-  # This can of course match any value which does not contain '/'.
-  resp "Hello " & @"name"
-```
-
-The patterns in Jester are currently a bit more limited, there is no
-wildcard patterns.
-
-You can use the '?' character to signify optional path parts.
-
-```nim
-get "/hello/@name?":
-  # This will match what the previous code example matches but will also match
-  # "/hello/".
-  if @"name" == "":
-    resp "No name received :("
-  else:
-    resp "Hello " & @"name"
+```sh
+nimble test -y
+python3 tests/integration/run_step16_suite.py
+python3 tests/perf/test_step17_tools.py
+bash tests/perf/run_step17.sh
 ```
 
-In this case you might want to make the leading '/' optional too, you can do this
-by changing the pattern to "/hello/?@name?". This is useful because Jester will
-not match "/hello" if the leading '/' is not made optional.
+The Step 17 measurements use loopback and a Python serial HTTP client. They do
+not prove peak RPS or release readiness. For Cortex-A5 deployments, measure
+on an actual armhf board and record its CPU, RAM, startup footprint and
+application-level throughput.
 
-### Regex
+## Documentation
 
-Regex can also be used as a route pattern. The subpattern captures will be
-placed in ``request.matches`` when a route is matched. For example:
+- [Jesterfork migration and API compatibility](docs/migration/jesterfork_to_jestersimple.md)
+- [Step 17 repeatable performance measurements](docs/performance/step17.md)
+- [Initial release checklist](docs/release/RELEASE_CHECKLIST.md)
+- [Proposed changes for the initial release](docs/release/CHANGES_FOR_INITIAL_RELEASE.md)
 
-```nim
-get re"^\/([0-9]{2})\.html$":
-  resp request.matches[0]
-```
+## Supported and unsupported behavior
 
-This will match URLs of the form ``/15.html``. In this case
-``request.matches[0]`` will be ``15``.
+Jester-style routing, response macros and exception handlers are retained
+where practical. Intentional security-related behavior changes are described
+in the migration guide. This release does not implement static HTTP Range
+(206/If-Range) or chunk extensions, and does not guarantee rejection of
+LF-only line endings in the request parser.
 
-## Conditions
+## License and provenance
 
-Jester supports conditions, however they are limited to a simple ``cond`` template.
-
-```nim
-routes:
-  get "/@name":
-    cond @"name" == "daniel"
-    # ``cond`` will pass execution to the next matching route if @"name" is not
-    # "daniel".
-    resp "Correct, my name is daniel."
-
-  get "/@name":
-    # This will be the next route that is matched.
-    resp "No, that's not my name."
-```
-
-## Return values
-
-Route bodies all have an implicit ``request`` object. This object is documented
-in jesterfork.nim and documentation can be generated by executing ``nim doc jesterfork.nim``.
-
-Returning a response from a route should be done using one of the following
-functions:
-
-  * One of the ``resp`` functions.
-  * By setting ``body``, ``headers`` and/or ``status`` and calling ``return``.
-  * ``redirect`` function
-  * ``attachment`` function
-
-There might be more. Take a look at the documentation of jesterfork.nim for more info.
-
-## Manual routing
-
-It is possible not to use the ``routes`` macro and to do the routing yourself.
-
-You can do this by writing your own ``match`` procedure. Take a look at
-[example2](tests/example2.nim) for an example on how to do this.
-
-## Static files
-
-By default Jester looks for static files in ``./public``. This can be overriden
-using the ``setStaticDir`` function. Files will be served like so:
-
-./public/css/style.css ``->`` http://example.com/css/style.css
-
-**Note**: Jester will only serve files, that are readable by ``others``. On
-Unix/Linux you can ensure this with ``chmod o+r ./public/css/style.css``.
-
-## Cookies
-
-Cookies can be set using the ``setCookie`` function.
-
-```nim
-get "/":
-  # Set a cookie "test:value" and make it expire in 5 days.
-  setCookie("test", @"value", daysForward(5))
-```
-
-They can then be accessed using the ``request.cookies`` procedure which returns
-a ``Table[string, string]``.
-
-## Request object
-
-The request object holds all the information about the current request.
-You can access it from a route using the ``request`` variable. It is defined as:
-
-```nim
-Request* = ref object
-  params*: StringTableRef       ## Parameters from the pattern, but also the
-                                ## query string.
-  matches*: array[MaxSubpatterns, string] ## Matches if this is a regex
-                                          ## pattern.
-  body*: string                 ## Body of the request, only for POST.
-                                ## You're probably looking for ``formData``
-                                ## instead.
-  headers*: StringTableRef      ## Headers received with the request.
-                                ## Retrieving these is case insensitive.
-  formData*: MultiData          ## Form data; only present for
-                                ## multipart/form-data
-  port*: int
-  host*: string
-  appName*: string              ## This is set by the user in ``run``, it is
-                                ## overriden by the "SCRIPT_NAME" scgi
-                                ## parameter.
-  pathInfo*: string             ## This is ``.path`` without ``.appName``.
-  secure*: bool
-  path*: string                 ## Path of request.
-  query*: string                ## Query string of request.
-  cookies*: StringTableRef      ## Cookies from the browser.
-  ip*: string                   ## IP address of the requesting client.
-  reqMeth*: HttpMethod          ## Request method, eg. HttpGet, HttpPost
-  settings*: Settings
-```
-
-## Examples
-
-### Custom router
-
-A custom router allows running your own initialization code and pass dynamic settings to Jester before starting the async loop.
-
-```nim
-import asyncdispatch, jesterfork, os, strutils
-
-router myrouter:
-  get "/":
-    resp "It's alive!"
-
-proc main() =
-  let port = paramStr(1).parseInt().Port
-  let settings = newSettings(port=port)
-  var jesterfork = initJester(myrouter, settings=settings)
-  jesterfork.serve()
-
-when isMainModule:
-  main()
-```
-
-### Github service hooks
-
-The code for this is pretty similar to the code for Sinatra given here: http://help.github.com/post-receive-hooks/
-
-```nim
-import jesterfork, json
-
-routes:
-  post "/":
-    var push = parseJson(@"payload")
-    resp "I got some JSON: " & $push
-```
+MIT-licensed, based on the work of Dominik Picheta and subsequent Jesterfork
+contributors. Preserve the original copyright notices and `license.txt`.

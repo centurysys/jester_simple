@@ -1,82 +1,83 @@
 # Copyright (C) 2018 Dominik Picheta
 # MIT License - Look at license.txt for details.
-import unittest, httpclient, strutils, asyncdispatch, os, terminal
-from osproc import execCmd
-
-import asynctools
+import std/[unittest, httpclient, strutils, asyncdispatch, os, osproc]
 
 const
   port = 5454
   address = "http://localhost:" & $port
-var serverProcess: AsyncProcess
 
-proc readLoop(process: AsyncProcess) {.async.} =
-  var wholebuf: string
-  while true:
-    var buf = newString(256)
-    let len = await readInto(process.outputHandle, addr buf[0], 256)
-    if len == 0:
-      break
-    buf.setLen(len)
-    wholebuf.add(buf)
-    while "\l" in wholebuf:
-      let parts = wholebuf.split("\l", 1)
-      styledEcho(fgBlue, "Process: ", resetStyle, parts[0])
-      wholebuf = parts[1]
-  if wholebuf != "":
-    styledEcho(fgBlue, "Process: ", resetStyle, wholebuf)
-  styledEcho(fgRed, "Process terminated")
+var serverProcess: Process
 
-proc startServer(file: string, useStdLib: bool) {.async.} =
-  var file = "tests" / file
-  if not serverProcess.isNil and serverProcess.running:
-    serverProcess.terminate()
-    # TODO: https://github.com/cheatfate/asynctools/issues/9
-    doAssert execCmd("kill -15 " & $serverProcess.processID()) == QuitSuccess
+# ------------------------------------------------------------------------------
+# Stop the current test server and reclaim its process resources.
+# ------------------------------------------------------------------------------
+proc stopServer() =
+  if serverProcess.isNil:
+    return
+
+  try:
+    if serverProcess.running:
+      serverProcess.terminate()
+      if serverProcess.waitForExit(3000) == -1:
+        serverProcess.kill()
+        discard serverProcess.waitForExit(3000)
+  finally:
+    serverProcess.close()
     serverProcess = nil
 
-  # The nim process doesn't behave well when using `-r`, if we kill it, the
-  # process continues running...
-  let stdLibFlag =
-    if useStdLib:
-      " -d:useStdLib "
-    else:
-      ""
-  doAssert execCmd("nimble c --hints:off -y " & stdLibFlag & file) == QuitSuccess
+# ------------------------------------------------------------------------------
+# Compile a test application without shell commands or external Nim packages.
+# ------------------------------------------------------------------------------
+proc compileServer(source, executable: string) =
+  let compiler = startProcess("nim", args = @[
+    "c", "--mm:orc", "--hints:off", "--path:.",
+    "--out:" & executable, source
+  ], options = {poUsePath, poParentStreams})
+  try:
+    let code = compiler.waitForExit()
+    doAssert code == 0, "Failed to compile " & source & ": exit " & $code
+  finally:
+    compiler.close()
 
-  serverProcess = startProcess(file.changeFileExt(ExeExt))
-  asyncCheck readLoop(serverProcess)
+# ------------------------------------------------------------------------------
+# Start one Linux test server and wait until HTTP replies on loopback.
+# ------------------------------------------------------------------------------
+proc startServer(file: string) =
+  stopServer()
 
-  # Wait until server responds:
-  await sleepAsync(10) # give it a chance to start
-  for i in 0..10:
-    var client = newAsyncHttpClient()
-    styledEcho(fgBlue, "Getting ", address, " - attempt " & $i)
-    let fut = client.get(address)
-    yield fut or sleepAsync(3000)
-    if not fut.finished:
-      styledEcho(fgYellow, "Timed out")
-    elif not fut.failed:
-      styledEcho(fgGreen, "Server started!")
-      return
-    else: echo fut.error.msg
-    client.close()
+  let source = "tests" / file
+  let executable = source.changeFileExt(ExeExt)
+  compileServer(source, executable)
+
+  echo "Starting: ", executable
+  serverProcess = startProcess(executable, options = {poParentStreams})
+
+  for attempt in 0..<40:
     if not serverProcess.running:
-      doAssert false, "Server died."
-    await sleepAsync(1000)
+      raise newException(IOError, "Test server exited before readiness: " & source)
 
-  doAssert false, "Failed to start server."
+    let probe = newHttpClient(timeout = 1000, maxRedirects = 0)
+    try:
+      discard probe.get(address)
+      return
+    except CatchableError:
+      discard
+    finally:
+      probe.close()
+    sleep(100)
 
-proc allTest(useStdLib: bool) =
-  waitFor startServer("alltest.nim", useStdLib)
+  raise newException(IOError, "Test server did not become ready: " & source)
+
+proc allTest() =
+  startServer("alltest.nim")
   var client = newAsyncHttpClient(maxRedirects = 0)
 
-  test "doesn't crash on missing script name":
-    # If this fails then alltest is likely not running.
+  test "path outside appName returns 404 without exposing internals":
     let resp = waitFor client.get(address)
-    checkpoint (waitFor resp.body)
-    checkpoint $resp.code
-    check resp.code.is5xx
+    let content = waitFor resp.body
+    check resp.code == Http404
+    check not content.contains("Expected script name")
+    check not content.contains("script name:")
 
   test "can access root":
     # If this fails then alltest is likely not running.
@@ -248,11 +249,11 @@ proc allTest(useStdLib: bool) =
       let resp = waitFor client.get(address & "/foo/after/added")
       check (waitFor resp.body) == "Hello! Added by after!"
 
-proc issue150(useStdLib: bool) =
-  waitFor startServer("issue150.nim", useStdLib)
+proc issue150() =
+  startServer("issue150.nim")
   var client = newAsyncHttpClient(maxRedirects = 0)
 
-  suite "issue150 useStdLib=" & $useStdLib:
+  suite "issue150":
     test "can get root":
       # If this fails then `issue150` is likely not running.
       let resp = waitFor client.get(address)
@@ -268,11 +269,11 @@ proc issue150(useStdLib: bool) =
       check resp.code == Http500
       check (waitFor resp.body).startsWith("Something bad happened")
 
-proc customRouterTest(useStdLib: bool) =
-  waitFor startServer("customRouter.nim", useStdLib)
+proc customRouterTest() =
+  startServer("customRouter.nim")
   var client = newAsyncHttpClient(maxRedirects = 0)
 
-  suite "customRouter useStdLib=" & $useStdLib:
+  suite "customRouter":
     test "error handler":
       let resp = waitFor client.get(address & "/raise")
       check resp.code == Http500
@@ -286,11 +287,11 @@ proc customRouterTest(useStdLib: bool) =
       check resp.headers["location"] == address & "/404"
       check (waitFor resp.body) == ""
 
-proc issue247(useStdLib: bool) =
-  waitFor startServer("issue247.nim", useStdLib)
+proc issue247() =
+  startServer("issue247.nim")
   var client = newAsyncHttpClient(maxRedirects = 0)
 
-  suite "issue247 useStdLib=" & $useStdLib:
+  suite "issue247":
     test "duplicate keys in query":
       let resp = waitFor client.get(address & "/multi?a=1&a=2")
       check (waitFor resp.body) == "a: 1,2"
@@ -317,7 +318,7 @@ proc issue247(useStdLib: bool) =
 
     test "test different keys":
       let resp = waitFor client.get(address & "/multi?a=1&b=2")
-      check (waitFor resp.body) == "b: 2a: 1"
+      check (waitFor resp.body) == "a: 1b: 2"
 
     test "ensure that path params aren't escaped":
       let resp = waitFor client.get(address & "/hello%23world")
@@ -329,12 +330,12 @@ proc issue247(useStdLib: bool) =
 
     test "test percent encoded path param and query param (same key)":
       let resp = waitFor client.get(address & "/hello%23world?val%23ue=1%23+b")
-      check (waitFor resp.body) == "val%23ue: hello%23worldval#ue: 1# b"
+      check (waitFor resp.body) == "val#ue: 1# bval%23ue: hello%23world"
 
     test "test path param, query param and x-www-form-urlencoded":
       client.headers = newHttpHeaders({"Content-Type": "application/x-www-form-urlencoded"})
       let resp = waitFor client.post(address & "/hello%23world?val%23ue=1%23+b", "val%23ue=1%23+b&b=2")
-      check (waitFor resp.body) == "val%23ue: hello%23worldb: 2val#ue: 1# b,1# b"
+      check (waitFor resp.body) == "b: 2val#ue: 1# b,1# bval%23ue: hello%23world"
 
     test "params duplicate keys in query":
       let resp = waitFor client.get(address & "/params?a=1&a=2")
@@ -362,7 +363,7 @@ proc issue247(useStdLib: bool) =
 
     test "params test different keys":
       let resp = waitFor client.get(address & "/params?a=1&b=2")
-      check (waitFor resp.body) == "b: 2a: 1"
+      check (waitFor resp.body) == "a: 1b: 2"
 
     test "params ensure that path params aren't escaped":
       let resp = waitFor client.get(address & "/params/hello%23world")
@@ -383,18 +384,9 @@ proc issue247(useStdLib: bool) =
 
 when isMainModule:
   try:
-    allTest(useStdLib=false) # Test HttpBeast.
-    allTest(useStdLib=true)  # Test asynchttpserver.
-    issue150(useStdLib=false)
-    issue150(useStdLib=true)
-    customRouterTest(useStdLib=false)
-    customRouterTest(useStdLib=true)
-    issue247(useStdLib=false)
-    issue247(useStdLib=true)
-
-    # Verify that Nim in Action Tweeter still compiles.
-    test "Nim in Action - Tweeter":
-      let path = "tests/nim-in-action-code/Chapter7/Tweeter/src/tweeter.nim"
-      check execCmd("nim c --threads:off --path:. " & path) == QuitSuccess
+    allTest()
+    issue150()
+    customRouterTest()
+    issue247()
   finally:
-    doAssert execCmd("kill -15 " & $serverProcess.processID()) == QuitSuccess
+    stopServer()

@@ -1,14 +1,17 @@
 # Copyright (C) 2015 Dominik Picheta
 # MIT License - Look at license.txt for details.
+
+when not defined(linux):
+  {.error: "Jester Simple supports Linux only".}
+
 import net, strtabs, re, tables, os, strutils, uri,
-       times, mimetypes, asyncnet, asyncdispatch, macros, md5,
-       logging, httpcore, asyncfile, macrocache, json, options,
+       times, mimetypes, asyncnet, asyncdispatch, macros,
+       logging, httpcore, macrocache, json, options,
        strformat
 
-import jesterfork/private/[errorpages, utils]
-import jesterfork/[request, patterns]
+import jestersimple/private/[errorpages, utils, responsevalidation, trustboundary, staticfiles]
+import jestersimple/[request, patterns]
 
-from cgi import decodeData, decodeUrl, CgiError
 
 export request
 export strtabs
@@ -21,12 +24,7 @@ export asyncdispatch
 
 export SameSite
 
-when useHttpBeast:
-  import httpbeastfork except Settings, Request
-  import options
-  from nativesockets import close
-else:
-  import asynchttpserver except Request
+import jestersimple/private/httptransport except Request
 
 type
   MatchProc* = proc (request: Request): Future[ResponseData] {.gcsafe, closure.}
@@ -52,8 +50,7 @@ type
     errorHandler: ErrorProc
 
   Jester* = object
-    when not useHttpBeast:
-      httpServer*: AsyncHttpServer
+    httpServer*: AsyncHttpServer
     settings: Settings
     matchers: seq[Matcher]
     errorHandlers: seq[ErrorProc]
@@ -83,13 +80,7 @@ type
     of RouteCode:
       data: ResponseData
 
-  Startup = proc () {.closure, gcsafe.}
-
 const jesterVer = "1.0.0"
-
-proc doNothing(): Startup {.gcsafe.} =
-  result = proc () {.closure, gcsafe.} =
-    discard
 
 proc toStr(headers: Option[RawHeaders]): string =
   return $newHttpHeaders(headers.get(@({:})))
@@ -107,11 +98,9 @@ proc createResponse(status: HttpCode, headers: RawHeaders): string =
   return "HTTP/1.1 " & $status & "\c\L" & createHeaders(headers) & "\c\L\c\L"
 
 proc unsafeSend(request: Request, content: string) =
-  when useHttpBeast:
-    request.getNativeReq.unsafeSend(content)
-  else:
-    # TODO: This may cause issues if we send too fast.
-    asyncCheck request.getNativeReq.client.send(content)
+  # Legacy synchronous API: queue sends in order and let the transport await
+  # their completion before closing the request's connection.
+  request.getNativeReq.queueRawWrite(content)
 
 proc newCompletedFuture(): Future[void] =
   result = newFuture[void]()
@@ -120,30 +109,35 @@ proc newCompletedFuture(): Future[void] =
 proc send(
   request: Request, code: HttpCode, headers: Option[RawHeaders], body: string
 ): Future[void] =
-  when useHttpBeast:
-    let h =
-      if headers.isNone: ""
-      else: headers.get().createHeaders
-    request.getNativeReq.send(code, body, h)
-    return newCompletedFuture()
-  else:
-    return request.getNativeReq.respond(
-      code, body, newHttpHeaders(headers.get(@({:})))
-    )
+  let rawHeaders = headers.get(@({:}))
+  validateRawHeaders(rawHeaders, body.len)
+  return request.getNativeReq.respond(code, body, newHttpHeaders(rawHeaders))
 
 proc statusContent(request: Request, status: HttpCode, content: string,
                    headers: Option[RawHeaders]): Future[void] =
+  if request.getNativeReq.rawOutputStarted:
+    # A route attempted to mix raw and managed output. Never append a second
+    # HTTP status line to an already-started raw response.
+    logging.error("Rejected managed response after raw output")
+    request.getNativeReq.abortRawWrites()
+    return newCompletedFuture()
   try:
     result = send(request, status, headers, content)
     when not defined(release):
       logging.debug("  $1 $2" % [$status, toStr(headers)])
-  except:
+  except ValueError:
+    # Never transmit an invalid field; the error page uses only fixed headers.
+    logging.error("Rejected invalid HTTP response headers")
+    result = request.getNativeReq.respond(
+      Http500, errorpages.error($Http500, jesterVer),
+      newHttpHeaders(@({"Content-Type": "text/html;charset=utf-8"}))
+    )
+  except CatchableError:
     result = newCompletedFuture()
-    logging.error("Could not send response: $1" % osErrorMsg(osLastError()))
+    logging.error("Could not send response")
 
-# TODO: Add support for proper Future Streams instead of this weird raw mode.
+# Raw mode is explicit so the router does not append a managed response.
 template enableRawMode* =
-  # TODO: Use the effect system to make this implicit?
   result.action = TCActionRaw
 
 proc send*(request: Request, content: string) =
@@ -152,11 +146,18 @@ proc send*(request: Request, content: string) =
   ## Routes using this procedure must enable raw mode.
   unsafeSend(request, content)
 
+proc sendAsync*(request: Request, content: string): Future[void] =
+  ## Awaitable raw output for larger or streamed responses. SendHeaders can
+  ## still be called synchronously before this; the transport preserves order.
+  ## Routes using this procedure must enable raw mode.
+  return request.getNativeReq.sendRawAsync(content)
+
 proc sendHeaders*(request: Request, status: HttpCode,
                   headers: RawHeaders) =
   ## Sends ``status`` and ``headers`` to the client socket immediately.
   ## The user is then able to send the content immediately to the client on
   ## the fly through the use of ``response.client``.
+  validateRawHeaders(headers)
   let headerData = createResponse(status, headers)
   try:
     request.send(headerData)
@@ -179,67 +180,97 @@ proc send*(request: Request, status: HttpCode, headers: RawHeaders,
            content: string) =
   ## Sends out a HTTP response comprising of the ``status``, ``headers`` and
   ## ``content`` specified.
-  var headers = headers & @({"Content-Length": $content.len})
-  request.sendHeaders(status, headers)
+  validateRawHeaders(headers, content.len)
+  var outHeaders = headers
+  var hasLength = false
+  for header in headers:
+    if cmpIgnoreCase(header.key, "Content-Length") == 0:
+      hasLength = true
+      break
+  if not hasLength:
+    outHeaders.add((key: "Content-Length", val: $content.len))
+  request.sendHeaders(status, outHeaders)
   request.send(content)
 
-# TODO: Cannot capture 'paths: varargs[string]' here.
+# ------------------------------------------------------------------------------
+# Send one already opened, validated regular file. All reads refer to the
+# descriptor returned by openat()/open(), never to a checked pathname.
+# ------------------------------------------------------------------------------
+proc sendPinnedStatic(
+  req: Request, asset: StaticOpen
+): Future[HttpCode] {.async.} =
+  let ext = asset.name.splitFile.ext
+  let mimetype = req.settings.mimes.getMimetype(
+    if ext.len > 0: ext[1 .. ^1] else: ""
+  )
+  let commonHeaders = @({
+    "Content-Type": mimetype,
+    "ETag": asset.etag
+  })
+
+  # The validator is metadata-only. No full-file read or hash is required
+  # even when the client makes a conditional request for a very large file.
+  let requestedTag: string = req.headers.getOrDefault("If-None-Match")
+  if ifNoneMatchMatches(requestedTag, asset.etag):
+    # HTTP 304 has no body. In particular, do not emit Content-Length: 0:
+    # that would contradict the length of the current representation.
+    await req.getNativeReq.respondHeaders(
+      Http304, newHttpHeaders(commonHeaders))
+    return Http304
+
+  let headers = @({
+    "Content-Type": mimetype,
+    "ETag": asset.etag,
+    "Content-Length": $asset.size
+  })
+  if req.reqMethod == HttpHead:
+    # HEAD returns the same representation metadata as GET, but no body.
+    await req.getNativeReq.respondHeaders(
+      Http200, newHttpHeaders(headers))
+    return Http200
+
+  # Always stream from the checked descriptor, with at most 16 KiB per
+  # read. Send the initial file bytes and response headers in ONE socket write.
+  # Separate tiny writes can trigger a ~40 ms Nagle/delayed-ACK stall even on
+  # localhost. Zero-length files still get a headers-only response.
+  try:
+    let firstCount = int(min(int64(StaticReadBlock), asset.size))
+    var firstChunk = ""
+    if firstCount > 0:
+      firstChunk = readStaticChunk(asset.fd, firstCount)
+      if firstChunk.len != firstCount:
+        raise newException(IOError, "Static file changed during transfer")
+    await req.getNativeReq.respondHeaders(
+      Http200, newHttpHeaders(headers), firstChunk)
+    var remaining = asset.size - int64(firstChunk.len)
+    while remaining > 0:
+      let count = int(min(int64(StaticReadBlock), remaining))
+      let chunk = readStaticChunk(asset.fd, count)
+      if chunk.len != count:
+        raise newException(IOError, "Static file changed during transfer")
+      await req.getNativeReq.client.send(chunk)
+      remaining -= int64(chunk.len)
+  except CatchableError:
+    # Headers may already have been sent, so a second status line would
+    # corrupt the response. Close; do not reuse the connection.
+    if not req.getNativeReq.client.isClosed:
+      req.getNativeReq.client.close()
+  return Http200
+
+# Explicit sendFile uses an application-chosen filename (possibly outside
+# staticDir), but now checks and streams the same opened file descriptor.
 proc sendStaticIfExists(
   req: Request, paths: seq[string]
 ): Future[HttpCode] {.async.} =
-  result = Http200
-  for p in paths:
-    if existsFile(p):
-
-      var fp = getFilePermissions(p)
-      if not fp.contains(fpOthersRead):
-        return Http403
-
-      let fileSize = getFileSize(p)
-      let ext = p.splitFile.ext
-      let mimetype = req.settings.mimes.getMimetype(
-        if ext.len > 0: ext[1 .. ^1]
-        else: ""
-      )
-      if fileSize < 10_000_000: # 10 mb
-        var file = readFile(p)
-
-        var hashed = getMD5(file)
-
-        # If the user has a cached version of this file and it matches our
-        # version, let them use it
-        if req.headers.hasKey("If-None-Match") and req.headers["If-None-Match"] == hashed:
-          await req.statusContent(Http304, "", none[RawHeaders]())
-        else:
-          await req.statusContent(Http200, file, some(@({
-            "Content-Type": mimetype,
-            "ETag": hashed
-          })))
-      else:
-        let headers = @({
-          "Content-Type": mimetype,
-          "Content-Length": $fileSize
-        })
-        await req.statusContent(Http200, "", some(headers))
-
-        var fileStream = newFutureStream[string]("sendStaticIfExists")
-        var file = openAsync(p, fmRead)
-        # Let `readToStream` write file data into fileStream in the
-        # background.
-        asyncCheck file.readToStream(fileStream)
-        # The `writeFromStream` proc will complete once all the data in the
-        # `bodyStream` has been written to the file.
-        while true:
-          let (hasValue, value) = await fileStream.read()
-          if hasValue:
-            req.unsafeSend(value)
-          else:
-            break
-        file.close()
-
-      return
-
-  # If we get to here then no match could be found.
+  for path in paths:
+    var asset = openExplicitStatic(path)
+    if asset.status == Http200:
+      try:
+        return await sendPinnedStatic(req, asset)
+      finally:
+        closeStatic(asset)
+    if asset.status == Http403:
+      return Http403
   return Http404
 
 proc close*(request: Request) =
@@ -247,41 +278,28 @@ proc close*(request: Request) =
   ##
   ## Routes using this procedure must enable raw mode.
   let nativeReq = request.getNativeReq()
-  when useHttpBeast:
-    nativeReq.forget()
   nativeReq.client.close()
 
+# ------------------------------------------------------------------------------
+# Never put an unhandled exception's message or stack trace in an HTTP page.
+# Log only the exception type; messages can contain credentials or input.
+# ------------------------------------------------------------------------------
 proc defaultErrorFilter(error: RouteError): ResponseData =
+  result.headers = some(@({"Content-Type": "text/html;charset=utf-8"}))
+  result.matched = true
+  result.action = TCActionSend
   case error.kind
   of RouteException:
-    let e = error.exc
-    let traceback = getStackTrace(e)
-    var errorMsg = e.msg
-    if errorMsg.len == 0: errorMsg = "(empty)"
-
-    let error = traceback & errorMsg
-    logging.error(error)
-    result.headers = some(@({
-      "Content-Type": "text/html;charset=utf-8"
-    }))
-    result.content = routeException(
-      error.replace("\n", "<br/>\n"),
-      jesterVer
-    )
-    result.code = Http502
-    result.matched = true
-    result.action = TCActionSend
+    let exc = error.exc
+    if exc.isNil:
+      logging.error("Unhandled route exception")
+    else:
+      logging.error("Unhandled route exception: " & $exc.name)
+    result.code = Http500
+    result.content = errorpages.error($Http500, jesterVer)
   of RouteCode:
-    result.headers = some(@({
-      "Content-Type": "text/html;charset=utf-8"
-    }))
-    result.content = error(
-      $error.data.code,
-      jesterVer
-    )
     result.code = error.data.code
-    result.matched = true
-    result.action = TCActionSend
+    result.content = errorpages.error($error.data.code, jesterVer)
 
 proc initRouteError(exc: ref Exception): RouteError =
   RouteError(
@@ -295,15 +313,24 @@ proc initRouteError(data: ResponseData): RouteError =
     data: data
   )
 
+# ------------------------------------------------------------------------------
+# If an error handler itself fails, fall back to a safe 500 response.
+# Keep access to the real exception in user-defined error handlers unchanged.
+# ------------------------------------------------------------------------------
 proc dispatchError(
   jes: Jester,
   request: Request,
   error: RouteError
 ): Future[ResponseData] {.async.} =
   for errorProc in jes.errorHandlers:
-    let data = await errorProc(request, error)
-    if data.matched:
-      return data
+    try:
+      let data = await errorProc(request, error)
+      if data.matched:
+        return data
+    except:
+      let handlerError = getCurrentException()
+      return defaultErrorFilter(RouteError(kind: RouteException,
+                                           exc: handlerError))
 
   return defaultErrorFilter(error)
 
@@ -324,34 +351,21 @@ proc dispatch(
 proc handleFileRequest(
   jes: Jester, req: Request
 ): Future[ResponseData] {.async.} =
-  # Find static file.
-  # TODO: Caching.
-  # no need to normalize staticDir since it is normalized in `newSettings`
-  let path = jes.settings.staticDir / normalizedPath(
-    cgi.decodeUrl(req.pathInfo)
-  )
+  if req.reqMethod notin {HttpGet, HttpHead}:
+    return (TCActionSend, Http404, none[seq[(string, string)]](), "", true)
+  # The URL is untrusted. Resolve components relative to a directory FD, with
+  # O_NOFOLLOW at every step. No lexical prefix comparison or path reopen.
+  var asset = openConfinedStatic(jes.settings.staticDir, req.pathInfo)
+  if asset.status == Http200:
+    try:
+      discard await sendPinnedStatic(req, asset)
+    finally:
+      closeStatic(asset)
+    result.action = TCActionRaw
+    result.matched = true
+    return
 
-  # Verify that this isn't outside our static dir.
-  var status = Http400
-  let pathDir = path.splitFile.dir & (if path.splitFile.dir[^1] == DirSep: "" else: $DirSep)
-  let staticDir = jes.settings.staticDir & (if jes.settings.staticDir[^1] == DirSep: "" else: $DirSep)
-  if pathDir.startsWith(staticDir):
-    if existsDir(path):
-      status = await sendStaticIfExists(
-        req,
-        @[path / "index.html", path / "index.htm"]
-      )
-    else:
-      status = await sendStaticIfExists(req, @[path])
-
-    # Http200 means that the data was sent so there is nothing else to do.
-    if status == Http200:
-      result[0] = TCActionRaw
-      when not defined(release):
-        logging.debug("  -> $1" % path)
-      return
-
-  return (TCActionSend, status, none[seq[(string, string)]](), "", true)
+  return (TCActionSend, asset.status, none[seq[(string, string)]](), "", true)
 
 proc handleRequestSlow(
   jes: Jester,
@@ -398,15 +412,38 @@ proc handleRequestSlow(
 
   # Cannot close the client socket. AsyncHttpServer may be keeping it alive.
 
+# ------------------------------------------------------------------------------
+# A path outside the configured mount is a 404, not a server-side exception.
+# Avoid logging or returning the invalid path as part of an error message.
+# ------------------------------------------------------------------------------
 proc handleRequest(jes: Jester, httpReq: NativeRequest): Future[void] =
   var req = initRequest(httpReq, jes.settings)
   try:
+    try:
+      discard req.pathInfo
+    except ValueError:
+      return statusContent(req, Http404, errorpages.error($Http404, jesterVer),
+        some(@({"Content-Type": "text/html;charset=utf-8"})))
+
+    # Malformed query/form escapes are client errors, not route exceptions.
+    # Do not include the supplied URL or form content in error logs.
+    if not req.validParameterEncoding:
+      return statusContent(req, Http400, errorpages.error($Http400, jesterVer),
+        some(@({"Content-Type": "text/html;charset=utf-8"})))
+
     when not defined(release):
-      logging.debug("$1 $2" % [$req.reqMethod, req.pathInfo])
+      logging.debug("HTTP request: " & $req.reqMethod)
 
     if likely(jes.matchers.len == 1 and not jes.matchers[0].async):
       let respData = jes.matchers[0].syncProc(req)
-      if likely(respData.matched):
+      # The synchronous single-matcher fast path is only valid when no
+      # framework error dispatch is required. Empty 4xx/5xx responses must
+      # reach the same custom error handlers as multi/async matchers.
+      let needsErrorDispatch =
+        (respData.code.is4xx or respData.code.is5xx) and
+        respData.content.len == 0
+      if likely(respData.matched and respData.action == TCActionSend and
+                not needsErrorDispatch):
         return statusContent(
           req,
           respData.code,
@@ -422,13 +459,17 @@ proc handleRequest(jes: Jester, httpReq: NativeRequest): Future[void] =
     let respDataFut = dispatchError(jes, req, initRouteError(exc))
     return handleRequestSlow(jes, req, respDataFut, true)
 
-  assert(not result.isNil, "Expected handleRequest to return a valid future.")
 
 proc newSettings*(
   port = Port(5000), staticDir = getCurrentDir() / "public",
-  appName = "", bindAddr = "", reusePort = false, maxBody = 8388608, numThreads = 0,
+  appName = "", bindAddr = "", reusePort = false, maxBody = 8388608,
   futureErrorHandler: proc (fut: Future[void]) {.closure, gcsafe.} = nil,
-  startup: Startup = doNothing()
+  maxConnections = 64, maxHeaderBytes = 16384, maxHeaderFields = 100,
+  headerTimeoutMs = 5000, bodyTimeoutMs = 15000,
+  keepAliveTimeoutMs = 5000,
+  trustedProxies: seq[string] = @[],
+  allowedHosts: seq[string] = @[],
+  publicBaseUrl = ""
 ): Settings =
   result = Settings(
     staticDir: normalizedPath(staticDir),
@@ -437,9 +478,16 @@ proc newSettings*(
     bindAddr: bindAddr,
     reusePort: reusePort,
     maxBody: maxBody,
-    numThreads: numThreads,
-    futureErrorHandler: futureErrorHandler,
-    startup: startup
+    maxConnections: maxConnections,
+    maxHeaderBytes: maxHeaderBytes,
+    maxHeaderFields: maxHeaderFields,
+    headerTimeoutMs: headerTimeoutMs,
+    bodyTimeoutMs: bodyTimeoutMs,
+    keepAliveTimeoutMs: keepAliveTimeoutMs,
+    trustedProxies: trustedProxies,
+    allowedHosts: allowedHosts,
+    publicBaseUrl: publicBaseUrl,
+    futureErrorHandler: futureErrorHandler
   )
 
 proc register*(self: var Jester, matcher: MatchProc) =
@@ -516,6 +564,7 @@ proc serve*(
     setLogFilter(when defined(release): lvlInfo else: lvlDebug)
 
   assert self.settings.staticDir.len > 0, "Static dir cannot be an empty string."
+  validateOriginSettings(self.settings)
 
   if self.settings.bindAddr.len > 0:
     logging.info("Jester is making jokes at http://$1:$2$3" %
@@ -524,12 +573,8 @@ proc serve*(
       ]
     )
   else:
-    when defined(windows):
-      logging.info("Jester is making jokes at http://127.0.0.1:$1$2 (all interfaces)" %
-                   [$self.settings.port, self.settings.appName])
-    else:
-      logging.info("Jester is making jokes at http://0.0.0.0:$1$2" %
-                   [$self.settings.port, self.settings.appName])
+    logging.info("Jester is making jokes at http://0.0.0.0:$1$2" %
+                 [$self.settings.port, self.settings.appName])
 
   var jes = self
   let domain = block:
@@ -541,30 +586,32 @@ proc serve*(
         AF_INET6
     else:
       AF_INET
-  when useHttpBeast:
-    run(
-      proc (req: httpbeastfork.Request): Future[void] =
-        {.gcsafe.}:
-          result = handleRequest(jes, req),
-      httpbeastfork.initSettings(self.settings.port, self.settings.bindAddr, self.settings.numThreads, startup = self.settings.startup, domain = domain)
-    )
+  self.httpServer = newAsyncHttpServer(
+    reusePort = self.settings.reusePort,
+    maxBody = self.settings.maxBody,
+    maxConnections = self.settings.maxConnections,
+    maxHeaderBytes = self.settings.maxHeaderBytes,
+    maxHeaderFields = self.settings.maxHeaderFields,
+    headerTimeoutMs = self.settings.headerTimeoutMs,
+    bodyTimeoutMs = self.settings.bodyTimeoutMs,
+    keepAliveTimeoutMs = self.settings.keepAliveTimeoutMs
+  )
+  let serveFut = self.httpServer.serve(
+    self.settings.port,
+    proc (req: httptransport.Request): Future[void] {.gcsafe, closure.} =
+      result = handleRequest(jes, req),
+    self.settings.bindAddr, domain = domain)
+  if not self.settings.futureErrorHandler.isNil:
+    serveFut.callback = self.settings.futureErrorHandler
   else:
-    self.httpServer = newAsyncHttpServer(reusePort=self.settings.reusePort, maxBody=self.settings.maxBody)
-    let serveFut = self.httpServer.serve(
-      self.settings.port,
-      proc (req: asynchttpserver.Request): Future[void] {.gcsafe, closure.} =
-        result = handleRequest(jes, req),
-      self.settings.bindAddr, domain = domain)
-    if not self.settings.futureErrorHandler.isNil:
-      serveFut.callback = self.settings.futureErrorHandler
-    else:
-      asyncCheck serveFut
-    runForever()
+    asyncCheck serveFut
+  runForever()
 
-template setHeader*(headers: var ResponseHeaders, key, value: string): typed =
-  ## Sets a response header using the given key and value.
-  ## Overwrites if the header key already exists.
-  bind isNone
+template setHeader*(headers: var ResponseHeaders, key, value: string) =
+  ## Set or replace a field, matching its name case-insensitively.
+  ## The final send path also validates directly assigned RawHeaders.
+  bind isNone, validateHeaderPair, cmpIgnoreCase
+  validateHeaderPair(key, value)
   if isNone(headers):
     headers = some(@({key: value}))
   else:
@@ -572,7 +619,8 @@ template setHeader*(headers: var ResponseHeaders, key, value: string): typed =
       # Overwrite key if it exists.
       var h = headers.get()
       for i in 0 ..< h.len:
-        if h[i][0] == key:
+        if cmpIgnoreCase(h[i][0], key) == 0:
+          h[i][0] = key
           h[i][1] = value
           headers = some(h)
           break outer
@@ -582,7 +630,7 @@ template setHeader*(headers: var ResponseHeaders, key, value: string): typed =
 
 template resp*(code: HttpCode,
                headers: openarray[tuple[key, val: string]],
-               content: string): typed =
+               content: string) =
   ## Sets ``(code, headers, content)`` as the response.
   bind TCActionSend
   result = (TCActionSend, code, result[2], content, true)
@@ -591,7 +639,7 @@ template resp*(code: HttpCode,
   break route
 
 
-template resp*(content: string, contentType = "text/html;charset=utf-8"): typed =
+template resp*(content: string, contentType = "text/html;charset=utf-8") =
   ## Sets ``content`` as the response; ``Http200`` as the status code
   ## and ``contentType`` as the Content-Type.
   bind TCActionSend, newHttpHeaders, strtabs.`[]=`
@@ -603,13 +651,13 @@ template resp*(content: string, contentType = "text/html;charset=utf-8"): typed 
   result.matched = true
   break route
 
-template resp*(content: JsonNode): typed =
+template resp*(content: JsonNode) =
   ## Serializes ``content`` as the response, sets ``Http200`` as status code
   ## and "application/json" Content-Type.
   resp($content, contentType="application/json")
 
 template resp*(code: HttpCode, content: string,
-               contentType = "text/html;charset=utf-8"): typed =
+               contentType = "text/html;charset=utf-8") =
   ## Sets ``content`` as the response; ``code`` as the status code
   ## and ``contentType`` as the Content-Type.
   bind TCActionSend, newHttpHeaders
@@ -620,7 +668,7 @@ template resp*(code: HttpCode, content: string,
   result.matched = true
   break route
 
-template resp*(code: HttpCode): typed =
+template resp*(code: HttpCode) =
   ## Responds with the specified ``HttpCode``. This ensures that error handlers
   ## are called.
   bind TCActionSend, newHttpHeaders
@@ -629,7 +677,7 @@ template resp*(code: HttpCode): typed =
   result.matched = true
   break route
 
-template redirect*(url: string, halt = true, httpStatusCode = Http303): typed =
+template redirect*(url: string, halt = true, httpStatusCode = Http303) =
   ## Redirects to ``url``. Returns from this request handler immediately.
   ##
   ## If ``halt`` is true, skips executing future handlers, too.
@@ -646,21 +694,21 @@ template redirect*(url: string, halt = true, httpStatusCode = Http303): typed =
   else:
     break route
 
-template pass*(): typed =
+template pass*() =
   ## Skips this request handler.
   ##
   ## If you want to stop this request from going further use ``halt``.
   result.action = TCActionPass
   break outerRoute
 
-template cond*(condition: bool): typed =
+template cond*(condition: bool) =
   ## If ``condition`` is ``False`` then ``pass`` will be called,
   ## i.e. this request handler will be skipped.
   if not condition: break outerRoute
 
 template halt*(code: HttpCode,
                headers: openarray[tuple[key, val: string]],
-               content: string): typed =
+               content: string) =
   ## Immediately replies with the specified request. This means any further
   ## code will not be executed after calling this template in the current
   ## route.
@@ -672,26 +720,25 @@ template halt*(code: HttpCode,
   result.matched = true
   break allRoutes
 
-template halt*(): typed =
+template halt*() =
   ## Halts the execution of this request immediately. Returns a 404.
   ## All previously set values are **discarded**.
   halt(Http404, {"Content-Type": "text/html;charset=utf-8"}, error($Http404, jesterVer))
 
-template halt*(code: HttpCode): typed =
+template halt*(code: HttpCode) =
   halt(code, {"Content-Type": "text/html;charset=utf-8"}, error($code, jesterVer))
 
-template halt*(content: string): typed =
+template halt*(content: string) =
   halt(Http404, {"Content-Type": "text/html;charset=utf-8"}, content)
 
-template halt*(code: HttpCode, content: string): typed =
+template halt*(code: HttpCode, content: string) =
   halt(code, {"Content-Type": "text/html;charset=utf-8"}, content)
 
-template attachment*(filename = ""): typed =
+template attachment*(filename = "") =
   ## Instructs the browser that the response should be stored on disk
   ## rather than displayed in the browser.
-  var disposition = "attachment"
+  let disposition = attachmentDisposition(extractFilename(filename))
   if filename != "":
-    disposition.add("; filename=\"" & extractFilename(filename) & "\"")
     let ext = splitFile(filename).ext
     let contentTypeSet =
       isSome(result[2]) and result[2].get().toTable.hasKey("Content-Type")
@@ -699,13 +746,13 @@ template attachment*(filename = ""): typed =
       setHeader(result[2], "Content-Type", getMimetype(request.settings.mimes, ext))
   setHeader(result[2], "Content-Disposition", disposition)
 
-template sendFile*(filename: string): typed =
+template sendFile*(filename: string) =
   ## Sends the file at the specified filename as the response.
   result[0] = TCActionRaw
   let sendFut = sendStaticIfExists(request, @[filename])
   yield sendFut
   let status = sendFut.read()
-  if status != Http200:
+  if status notin {Http200, Http304}:
     raise newException(JesterError, "Couldn't send requested file: " & filename)
   # This will be set by our macro, so this is here for those not using it.
   result.matched = true
@@ -753,7 +800,9 @@ proc makeUri*(request: Request, address = "", absolute = true,
   uri.path = "/"
   uri.query = ""
   uri.anchor = ""
-  if absolute:
+  # Without a validated Host or explicitly configured publicBaseUrl,
+  # fall back to a relative URI instead of trusting an attacker Host field.
+  if absolute and request.host.len > 0:
     uri.hostname = request.host
     uri.scheme = (if request.secure: "https" else: "http")
     if request.port != (if request.secure: 443 else: 80):
@@ -780,15 +829,23 @@ proc daysForward*(days: int): DateTime =
   ## Returns a DateTime object referring to the current time plus ``days``.
   return getTime().utc + initTimeInterval(days = days)
 
+# ------------------------------------------------------------------------------
+# Set-Cookie is not a comma-combinable header. Always append a new field.
+# This also avoids the nested setHeader template used for the first cookie.
+# ------------------------------------------------------------------------------
+proc appendSetCookieHeader(headersOpt: var ResponseHeaders, cookie: string) =
+  validateHeaderPair("Set-Cookie", cookie)
+  var rawHeaders: RawHeaders = @[]
+  if headersOpt.isSome:
+    rawHeaders = headersOpt.get()
+  rawHeaders.add((key: "Set-Cookie", val: cookie))
+  headersOpt = some(rawHeaders)
+
 template setCookie*(headersOpt: var ResponseHeaders, name, value: string, expires="",
                     sameSite: SameSite=Lax, secure = false,
                     httpOnly = false, domain = "", path = "") =
   let newCookie = makeCookie(name, value, expires, domain, path, secure, httpOnly, sameSite)
-  if isSome(headersOpt) and
-     (let headers = headersOpt.get(); headers.toTable.hasKey("Set-Cookie")):
-    headersOpt = some(headers & @({"Set-Cookie": newCookie}))
-  else:
-    setHeader(headersOpt, "Set-Cookie", newCookie)
+  appendSetCookieHeader(headersOpt, newCookie)
 
 template setCookie*(name, value: string, expires="",
                     sameSite: SameSite=Lax, secure = false,
@@ -811,9 +868,12 @@ template setCookie*(name, value: string, expires: DateTime,
             sameSite, secure, httpOnly, domain, path)
 
 proc normalizeUri*(uri: string): string =
-  ## Remove any trailing ``/``.
-  if uri[uri.len-1] == '/': result = uri[0 .. uri.len-2]
-  else: result = uri
+  ## Remove a trailing slash, retaining the empty string and root URI.
+  if uri.len <= 1:
+    return uri
+  if uri[^1] == '/':
+    return uri[0 .. ^2]
+  return uri
 
 # -- Macro
 
@@ -1085,7 +1145,7 @@ proc createError(
   else:
     error("Expected exception type or set[HttpCode].", errorCond)
 
-const definedRoutes = CacheTable"jesterfork.routes"
+const definedRoutes = CacheTable"jestersimple.routes"
 
 proc processRoutesBody(
   body: NimNode,

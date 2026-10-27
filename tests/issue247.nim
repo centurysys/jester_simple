@@ -1,21 +1,34 @@
-from std/cgi import decodeUrl
+from std/algorithm import sort
 from std/strformat import fmt
 from std/strutils import join
-import jesterfork
+import jestersimple
 
 settings:
   port = Port(5454)
   bindAddr = "127.0.0.1"
 
+# ------------------------------------------------------------------------------
+# Sort test-only output keys because Table iteration order is unspecified.
+# ------------------------------------------------------------------------------
+proc sortedKeys[T](params: Table[string, T]): seq[string] =
+  for key in params.keys:
+    result.add key
+  result.sort()
+
+# ------------------------------------------------------------------------------
+# Render single-value parameters in a deterministic order for HTTP assertions.
+# ------------------------------------------------------------------------------
 proc formatParams(params: Table[string, string]): string =
-  result = ""
-  for key, value in params.pairs:
+  for key in sortedKeys(params):
+    let value = params[key]
     result.add fmt"{key}: {value}"
 
+# ------------------------------------------------------------------------------
+# Render multi-value parameters without changing each key's value order.
+# ------------------------------------------------------------------------------
 proc formatSeqParams(params: Table[string, seq[string]]): string =
-  result = ""
-  for key, values in params.pairs:
-    let value = values.join ","
+  for key in sortedKeys(params):
+    let value = params[key].join(",")
     result.add fmt"{key}: {value}"
 
 routes:

@@ -1,13 +1,13 @@
 # Copyright (C) 2018 Dominik Picheta
 # MIT License - Look at license.txt for details.
-import jesterfork, asyncdispatch, strutils, random, os, asyncnet, re, typetraits
+import jestersimple, asyncdispatch, strutils, random, os, re, typetraits
 import json
 
 import alltest_router2
 
 type
-  MyCustomError = object of Exception
-  RaiseAnotherError = object of Exception
+  MyCustomError = object of CatchableError
+  RaiseAnotherError = object of CatchableError
 
 
 template return200(): untyped =
@@ -40,7 +40,9 @@ routes:
     resp "This should NOT be the response"
 
   get "/halt":
-    halt Http502, "I'm sorry, this page has been halted."
+    # Keep this a runtime condition so the following statement tests halting.
+    if request.pathInfo == "/halt":
+      halt Http502, "I'm sorry, this page has been halted."
     resp "test"
 
   get "/halt":
@@ -63,7 +65,9 @@ routes:
     redirect(uri(@"url"))
 
   get "/redirect-halt/@url/?":
-    redirect(uri(@"url"))
+    # The final response must not overwrite a successful redirect.
+    if request.pathInfo.startsWith("/redirect-halt/"):
+      redirect(uri(@"url"))
     resp "ok"
 
   before re"/redirect-before/.*?":
@@ -139,7 +143,9 @@ routes:
     resp Http200, body
 
   get "/template":
-    return200()
+    # Verify that a response from a template terminates route execution.
+    if request.pathInfo == "/template":
+      return200()
     resp Http404, "Template not working"
 
   get "/nil":
