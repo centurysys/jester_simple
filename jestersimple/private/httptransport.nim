@@ -553,6 +553,10 @@ proc processRequest(
 
   request.headers.clear()
   request.body = ""
+  # HttpHead is enum zero. Before the request line is parsed, rejectRequest
+  # must not mistake an invalid request for HEAD and omit its error body.
+  # Reset on every keep-alive iteration because Request is reused.
+  request.reqMethod = HttpGet
   when defined(gcArc) or defined(gcOrc) or defined(gcAtomicArc):
     request.hostname = address
   else:
@@ -672,7 +676,30 @@ proc processRequest(
       if lowerKey in forwardingFields:
         return await rejectRequest(request, Http400)
       forwardingFields.add(lowerKey)
-    request.headers[key] = value
+    # Reject duplicates where different interpretations can affect security,
+    # response negotiation, or authentication. Framing, Host and forwarding
+    # fields have already been checked above.
+    if request.headers.hasKey(key):
+      case key.toLowerAscii()
+      of "connection":
+        # Connection is a comma-separated token list. Keep every token so
+        # that a later keep-alive cannot discard an earlier close.
+        let previous: string = request.headers[key]
+        request.headers[key] = previous & ", " & value
+      of "cookie":
+        # A split Cookie header is joined with '; ', never commas. High-level
+        # request.cookies reads one value from HttpHeaders.
+        let previous: string = request.headers[key]
+        request.headers[key] = previous & "; " & value
+      of "authorization", "proxy-authorization", "expect", "upgrade",
+         "origin", "content-type":
+        return await rejectRequest(request, Http400)
+      else:
+        # Keep repeated ordinary fields instead of silently using the last.
+        # Callers can use HttpHeaders[key, index] to inspect each value.
+        request.headers.add(key, value)
+    else:
+      request.headers[key] = value
     if request.headers.len > headerLimit:
       return await rejectRequest(request, Http400)
 
