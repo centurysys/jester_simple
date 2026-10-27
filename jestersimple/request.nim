@@ -1,4 +1,4 @@
-import uri, tables, strutils, strtabs, re, options
+import uri, tables, strutils, strtabs, re, options, asyncnet
 
 import private/utils
 
@@ -195,6 +195,17 @@ proc initRequest*(req: NativeRequest, settings: Settings): Request {.inline.} =
 
 proc getNativeReq*(req: Request): NativeRequest =
   req.req
+
+# ------------------------------------------------------------------------------
+# API: Begin a protocol Upgrade on the existing, transport-owned AsyncSocket.
+# Call only after validating the incoming Upgrade request and before sending
+# HTTP 101. Do not return from the route until the upgraded session ends.
+# ------------------------------------------------------------------------------
+proc beginUpgrade*(req: Request): AsyncSocket =
+  req.req.beginUpgrade()
+
+proc upgradeStarted*(req: Request): bool {.inline.} =
+  req.req.upgradeStarted()
 
 #[ Only to be used by our route macro. ]#
 proc setPatternParams*(req: var Request, p: Table[string, string]) =

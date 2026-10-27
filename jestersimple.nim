@@ -116,10 +116,11 @@ proc send(
 
 proc statusContent(request: Request, status: HttpCode, content: string,
                    headers: Option[RawHeaders]): Future[void] =
-  if request.getNativeReq.rawOutputStarted:
-    # A route attempted to mix raw and managed output. Never append a second
-    # HTTP status line to an already-started raw response.
-    logging.error("Rejected managed response after raw output")
+  if request.getNativeReq.responseStarted:
+    # Never append HTTP headers after a managed/raw response or Upgrade.
+    # In particular, an exception after HTTP 101 must close the connection,
+    # not dispatch a second HTTP status line (such as HTTP 500).
+    logging.error("Rejected managed response after output was started")
     request.getNativeReq.abortRawWrites()
     return newCompletedFuture()
   try:
@@ -158,6 +159,11 @@ proc sendHeaders*(request: Request, status: HttpCode,
   ## Sends ``status`` and ``headers`` to the client socket immediately.
   ## The user is then able to send the content immediately to the client on
   ## the fly through the use of ``response.client``.
+  if request.upgradeStarted or
+      (request.getNativeReq.responseStarted and
+       not request.getNativeReq.rawOutputStarted):
+    raise newException(ValueError,
+      "Raw HTTP headers are forbidden after response or Upgrade")
   validateRawHeaders(headers)
   let headerData = createResponse(status, headers)
   try:

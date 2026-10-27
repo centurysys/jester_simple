@@ -54,9 +54,14 @@ type
     active: bool
     deadlineTicks: int64
 
-  # A ref is shared by the native request and its high-level Jester copy.
+  # The request is copied between transport and router layers. Keep the
+  # response state in a ref so every copy sees the same irreversible transition.
+  OutputMode = enum
+    omIdle, omManaged, omRaw, omUpgraded
+
   # Raw writers must finish before processRequest can close the connection.
   RawWriteState = ref object
+    mode: OutputMode
     client: AsyncSocket
     pending: Future[void]
     failed: bool
@@ -140,12 +145,15 @@ proc writeRawOrdered(state: RawWriteState, previous: Future[void],
     state.queuedBytes -= payload.len
 
 proc enqueueRawWrite(state: RawWriteState, payload: string): Future[void] =
+  if state.mode notin {omIdle, omRaw}:
+    raise newException(ValueError, "HTTP output already started or upgraded")
   if state.failed or state.client.isClosed:
     raise newException(IOError, "Raw response connection is closed")
   if payload.len > MaxQueuedRawBytes - state.queuedBytes or
       state.queuedWrites >= MaxQueuedRawWrites:
     raise newException(ValueError, "Raw response queue limit exceeded; use sendAsync")
   let previous = state.pending
+  state.mode = omRaw
   state.started = true
   inc state.queuedWrites
   state.queuedBytes += payload.len
@@ -155,6 +163,8 @@ proc enqueueRawWrite(state: RawWriteState, payload: string): Future[void] =
 proc queueRawWrite*(req: Request, payload: string) =
   if req.rawWrites.isNil:
     raise newException(ValueError, "Raw write state is not initialized")
+  if req.rawWrites.mode notin {omIdle, omRaw}:
+    raise newException(ValueError, "Raw writes are forbidden after HTTP response or Upgrade")
   if payload.len > 0:
     discard enqueueRawWrite(req.rawWrites, payload)
 
@@ -164,6 +174,8 @@ proc sendRawAsync*(req: Request, payload: string) {.async.} =
   ## unbounded chain of Futures or per-write task objects.
   if req.rawWrites.isNil:
     raise newException(ValueError, "Raw write state is not initialized")
+  if req.rawWrites.mode notin {omIdle, omRaw}:
+    raise newException(ValueError, "Raw writes are forbidden after HTTP response or Upgrade")
   var offset = 0
   while offset < payload.len:
     let count = min(MaxQueuedRawBytes, payload.len - offset)
@@ -181,8 +193,43 @@ proc sendRawAsync*(req: Request, payload: string) {.async.} =
       raise newException(IOError, "Raw response send failed")
     offset += count
 
+# ------------------------------------------------------------------------------
+# API: Report whether the connection has begun any HTTP response or Upgrade.
+# This is shared across NativeRequest copies; it does not inspect socket bytes.
+# ------------------------------------------------------------------------------
+proc responseStarted*(req: Request): bool {.inline.} =
+  not req.rawWrites.isNil and req.rawWrites.mode != omIdle
+
 proc rawOutputStarted*(req: Request): bool {.inline.} =
-  not req.rawWrites.isNil and req.rawWrites.started
+  not req.rawWrites.isNil and req.rawWrites.mode == omRaw
+
+proc upgradeStarted*(req: Request): bool {.inline.} =
+  not req.rawWrites.isNil and req.rawWrites.mode == omUpgraded
+
+# ------------------------------------------------------------------------------
+# API: Reserve the connection for a protocol upgrade before writing HTTP 101.
+# The caller validates the handshake first and awaits the upgraded session
+# within the route Future. The HTTP transport retains ownership of the socket.
+# An unsuccessful handshake after reservation must close, not send HTTP 4xx.
+# ------------------------------------------------------------------------------
+proc beginUpgrade*(req: Request): AsyncSocket =
+  if req.rawWrites.isNil or req.client.isNil or req.client.isClosed:
+    raise newException(IOError, "Upgrade connection is unavailable")
+  if req.rawWrites.mode != omIdle or req.rawWrites.failed:
+    raise newException(ValueError, "HTTP response already started or upgraded")
+  req.rawWrites.mode = omUpgraded
+  return req.client
+
+# ------------------------------------------------------------------------------
+# Reserve the normal HTTP output path before scheduling its first socket send.
+# Validation must happen before this transition to permit a fixed 500 fallback.
+# ------------------------------------------------------------------------------
+proc beginManagedResponse(req: Request) =
+  if req.rawWrites.isNil or req.client.isNil or req.client.isClosed:
+    raise newException(IOError, "HTTP response connection is unavailable")
+  if req.rawWrites.mode != omIdle or req.rawWrites.failed:
+    raise newException(ValueError, "HTTP output already started or upgraded")
+  req.rawWrites.mode = omManaged
 
 proc abortRawWrites*(req: Request) =
   if not req.rawWrites.isNil:
@@ -206,6 +253,7 @@ proc addHeaders(msg: var string, headers: HttpHeaders) =
 
 proc sendHeaders*(req: Request, headers: HttpHeaders): Future[void] =
   validateHttpHeaders(headers)
+  req.beginManagedResponse()
   var msg = ""
   msg.addHeaders(headers)
   return req.client.send(msg)
@@ -222,6 +270,7 @@ proc respondHeaders*(req: Request, code: HttpCode,
   # Nagle/delayed-ACK interaction for tens of milliseconds on keep-alive TCP.
   # Content-Length describes the complete file, not only firstBodyChunk.
   validateHttpHeaders(headers)
+  req.beginManagedResponse()
   var msg = "HTTP/1.1 " & $code & "\c\L"
   if headers != nil:
     msg.addHeaders(headers)
@@ -232,6 +281,7 @@ proc respondHeaders*(req: Request, code: HttpCode,
 proc respond*(req: Request, code: HttpCode, content: string,
               headers: HttpHeaders = nil): Future[void] =
   validateHttpHeaders(headers, content.len)
+  req.beginManagedResponse()
   var msg = "HTTP/1.1 " & $code & "\c\L"
   if headers != nil:
     msg.addHeaders(headers)
@@ -560,6 +610,11 @@ proc processRequest(
   # response before the transport tears down this socket.
   if not (await drainRawWrites(request)):
     request.client.close()
+    return false
+
+  # No further HTTP parser iteration after an explicit protocol upgrade.
+  # Closing the socket remains processClient's responsibility.
+  if request.upgradeStarted:
     return false
 
   if "upgrade" in request.headers.getOrDefault("connection"):
