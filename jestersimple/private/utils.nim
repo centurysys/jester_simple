@@ -20,6 +20,8 @@ type
     bodyTimeoutMs*: int
     keepAliveTimeoutMs*: int
     managedSendTimeoutMs*: int
+    responseStartTimeoutMs*: int
+    streamTotalTimeoutMs*: int
     trustedProxies*: seq[string]
     allowedHosts*: seq[string]
     publicBaseUrl*: string

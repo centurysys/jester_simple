@@ -72,3 +72,36 @@ high-water RSS from leaked connections.
 An explicitly upgraded connection does not enter any Managed response path, so
 this deadline cannot terminate a valid long-lived upgraded session. WebSocket
 handshake/frame and idle/heartbeat policies belong to the protocol adapter.
+
+## JS-06 response-start and streaming budgets
+
+The transport has three distinct response-related budgets:
+
+- `managedSendTimeoutMs` (default 15,000): maximum wait per managed socket
+  send; existing semantics from JS-05.
+- `responseStartTimeoutMs` (default 15,000): maximum time a request may remain
+  in the pre-response phase while its route Future is pending. On expiry the
+  transport closes the socket, marks output aborted and releases its connection
+  slot. This is **not** preemptive cancellation: application Futures may still
+  execute after the client connection is gone. Application code must honor
+  cancellation/stop conditions itself when doing substantial work.
+- `streamTotalTimeoutMs` (default 60,000): elapsed budget from the initial
+  header send to completion of managed streamed body chunks. Each chunk also
+  uses the Managed send timeout, bounded by the remaining stream budget.
+
+Once a route starts a Managed/Raw response or calls `beginUpgrade()`, the
+response-start budget no longer governs its Future. The transport continues
+owning upgraded sockets and closes them after the route Future completes.
+Raw writes retain their own queue limits and per-write timeout. WebSocket
+heartbeat, frame, and idle deadlines remain the ws library's responsibility.
+
+The `sendStreamChunk` transport API is for **awaited, ordered** chunks after
+`respondHeaders`. It refuses concurrent calls and chunks larger than 64KiB.
+The built-in pinned static-file path streams at 16KiB per chunk and now uses
+this API. Do not call a separate `client.send` concurrently with a managed
+stream on the same socket.
+
+A route that starts an arbitrary long-running custom Raw response is not
+subject to the Managed stream total deadline. Such routes must implement
+application-specific bounds; this step does not claim general cancellation
+of arbitrary application work.

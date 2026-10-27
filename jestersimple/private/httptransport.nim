@@ -20,6 +20,7 @@ const
   MaxQueuedRawBytes* = 256 * 1024
   MaxQueuedRawWrites* = 64
   RawSendTimeoutMs = 15_000
+  MaxManagedStreamChunkBytes* = 64 * 1024
 
 # ------------------------------------------------------------------------------
 # Public transport types match Nim 2.2.12 asynchttpserver.
@@ -49,6 +50,8 @@ type
     bodyTimeoutMs: int
     keepAliveTimeoutMs: int
     managedSendTimeoutMs: int
+    responseStartTimeoutMs: int
+    streamTotalTimeoutMs: int
 
   ConnectionWatch = ref object
     client: AsyncSocket
@@ -58,7 +61,7 @@ type
   # The request is copied between transport and router layers. Keep the
   # response state in a ref so every copy sees the same irreversible transition.
   OutputMode = enum
-    omIdle, omManaged, omRaw, omUpgraded
+    omIdle, omManaged, omRaw, omUpgraded, omAborted
 
   # Raw writers must finish before processRequest can close the connection.
   RawWriteState = ref object
@@ -70,6 +73,10 @@ type
     queuedBytes: int
     queuedWrites: int
     managedSendTimeoutMs: int
+    streamTotalTimeoutMs: int
+    streamDeadlineTicks: int64
+    streamAllowed: bool
+    streamSending: bool
 
 # ------------------------------------------------------------------------------
 # API: Return the bound port (including an automatically assigned port).
@@ -85,7 +92,9 @@ proc newAsyncHttpServer*(reuseAddr = true, reusePort = false,
                          maxHeaderBytes = 16384, maxHeaderFields = 100,
                          headerTimeoutMs = 5000, bodyTimeoutMs = 15000,
                          keepAliveTimeoutMs = 5000,
-                         managedSendTimeoutMs = 15000): AsyncHttpServer =
+                         managedSendTimeoutMs = 15000,
+                         responseStartTimeoutMs = 15000,
+                         streamTotalTimeoutMs = 60000): AsyncHttpServer =
   AsyncHttpServer(
     reuseAddr: reuseAddr, reusePort: reusePort,
     maxBody: max(0, maxBody),
@@ -95,7 +104,9 @@ proc newAsyncHttpServer*(reuseAddr = true, reusePort = false,
     headerTimeoutMs: max(1, headerTimeoutMs),
     bodyTimeoutMs: max(1, bodyTimeoutMs),
     keepAliveTimeoutMs: max(1, keepAliveTimeoutMs),
-    managedSendTimeoutMs: max(1, managedSendTimeoutMs)
+    managedSendTimeoutMs: max(1, managedSendTimeoutMs),
+    responseStartTimeoutMs: max(1, responseStartTimeoutMs),
+    streamTotalTimeoutMs: max(1, streamTotalTimeoutMs)
   )
 
 # ------------------------------------------------------------------------------
@@ -238,6 +249,10 @@ proc beginManagedResponse(req: Request) =
 proc abortRawWrites*(req: Request) =
   if not req.rawWrites.isNil:
     req.rawWrites.failed = true
+    # A timed-out route may still complete later. Its Request copies must
+    # reject any late managed response, including a generated error page.
+    if req.rawWrites.mode == omIdle:
+      req.rawWrites.mode = omAborted
     if not req.client.isClosed:
       req.client.close()
 
@@ -252,13 +267,16 @@ proc drainRawWrites(req: Request): Future[bool] {.async.} =
 # API: Enforce a deadline for each transport-managed HTTP socket send.
 # withTimeout does not cancel the underlying send Future. On expiry, close the
 # transport-owned socket and do not await a possibly stuck send indefinitely.
-# This does not apply to upgraded connections or directly streamed body chunks.
+# This does not apply to upgraded connections. Streaming chunks also obey the
+# smaller of this deadline and the remaining whole-stream deadline.
 # ------------------------------------------------------------------------------
-proc sendManagedTimed(req: Request, payload: string): Future[void] {.async.} =
+proc sendManagedTimed(req: Request, payload: string,
+                      timeoutMs = 0): Future[void] {.async.} =
   let state = req.rawWrites
+  let deadline = if timeoutMs > 0: timeoutMs else: state.managedSendTimeoutMs
   try:
     let sending = state.client.send(payload)
-    if not (await withTimeout(sending, state.managedSendTimeoutMs)):
+    if not (await withTimeout(sending, deadline)):
       raise newException(IOError, "Managed HTTP send timed out")
     await sending
   except CatchableError:
@@ -294,12 +312,47 @@ proc respondHeaders*(req: Request, code: HttpCode,
   # Content-Length describes the complete file, not only firstBodyChunk.
   validateHttpHeaders(headers)
   req.beginManagedResponse()
+  # A streaming response has both a per-send timeout and one total budget.
+  # The deadline starts before the first (headers + body) socket send.
+  req.rawWrites.streamAllowed = true
+  req.rawWrites.streamDeadlineTicks = getMonoTime().ticks +
+    int64(req.rawWrites.streamTotalTimeoutMs) * 1_000_000
   var msg = "HTTP/1.1 " & $code & "\c\L"
   if headers != nil:
     msg.addHeaders(headers)
   msg.add("\c\L")
   msg.add(firstBodyChunk)
-  return req.sendManagedTimed(msg)
+  let firstSendBudget = min(req.rawWrites.managedSendTimeoutMs,
+                            req.rawWrites.streamTotalTimeoutMs)
+  return req.sendManagedTimed(msg, firstSendBudget)
+
+# ------------------------------------------------------------------------------
+# API: Append one bounded chunk to a managed streaming response.
+# The caller must await each chunk before sending the next. A total deadline
+# prevents slow trickle traffic from holding a connection indefinitely.
+# ------------------------------------------------------------------------------
+proc sendStreamChunk*(req: Request, chunk: string): Future[void] {.async.} =
+  let state = req.rawWrites
+  if state.isNil or state.mode != omManaged or not state.streamAllowed or
+      state.failed or state.client.isClosed:
+    raise newException(IOError, "Managed stream is unavailable")
+  if state.streamSending:
+    raise newException(ValueError, "Concurrent managed stream sends are unsupported")
+  if chunk.len > MaxManagedStreamChunkBytes:
+    raise newException(ValueError, "Managed stream chunk exceeds size limit")
+  let nanosRemaining = state.streamDeadlineTicks - getMonoTime().ticks
+  if nanosRemaining <= 0:
+    state.failed = true
+    if not state.client.isClosed:
+      state.client.close()
+    raise newException(IOError, "Managed stream exceeded total deadline")
+  let msRemaining = max(1, (nanosRemaining + 999_999) div 1_000_000)
+  let sendBudget = min(int64(state.managedSendTimeoutMs), msRemaining)
+  state.streamSending = true
+  try:
+    await req.sendManagedTimed(chunk, int(sendBudget))
+  finally:
+    state.streamSending = false
 
 proc respond*(req: Request, code: HttpCode, content: string,
               headers: HttpHeaders = nil): Future[void] =
@@ -506,7 +559,8 @@ proc processRequest(
     request.hostname.shallowCopy(address)
   request.client = client
   request.rawWrites = RawWriteState(
-    client: client, managedSendTimeoutMs: server.managedSendTimeoutMs)
+    client: client, managedSendTimeoutMs: server.managedSendTimeoutMs,
+    streamTotalTimeoutMs: server.streamTotalTimeoutMs)
 
   # Include request line and blank lines in the aggregate header budget.
   var headerBytes = 0
@@ -666,7 +720,34 @@ proc processRequest(
   # The receive timeout does not cover application processing or output.
   # Those paths are treated separately in later steps.
   watch.deadlineTicks = high(int64)
-  await callback(request)
+  # Limit the time until a route starts producing output. This is not a
+  # cancellation mechanism for arbitrary application code: after expiry, the
+  # connection closes and the route's Future may still run until it completes.
+  # An upgraded or streaming response is not subject to this startup budget.
+  let routeFuture = callback(request)
+  let responseDeadline = getMonoTime().ticks +
+    int64(server.responseStartTimeoutMs) * 1_000_000
+  while not routeFuture.finished and not request.responseStarted:
+    let nanosRemaining = responseDeadline - getMonoTime().ticks
+    if nanosRemaining <= 0:
+      request.abortRawWrites()
+      return false
+    let sliceMs = int(min(250'i64,
+      max(1'i64, (nanosRemaining + 999_999) div 1_000_000)))
+    if await withTimeout(routeFuture, sliceMs):
+      break
+  # Streaming routes may yield between chunks. Do not rely on the next chunk
+  # to enforce the whole-response budget; the Future itself is bounded too.
+  while not routeFuture.finished and request.rawWrites.streamAllowed:
+    let nanosRemaining = request.rawWrites.streamDeadlineTicks - getMonoTime().ticks
+    if nanosRemaining <= 0:
+      request.abortRawWrites()
+      return false
+    let sliceMs = int(min(250'i64,
+      max(1'i64, (nanosRemaining + 999_999) div 1_000_000)))
+    if await withTimeout(routeFuture, sliceMs):
+      break
+  await routeFuture
   # Even when the peer sent Connection: close, complete the queued raw
   # response before the transport tears down this socket.
   if not (await drainRawWrites(request)):

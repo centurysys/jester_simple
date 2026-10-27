@@ -137,3 +137,15 @@ MIT license. Derived from the work of Dominik Picheta and Jesterfork
 contributors. The original `license.txt` and source-level copyright notices
 are retained. The prior Jester release history is documented upstream at
 [dom96/jester](https://github.com/dom96/jester).
+
+### JS-06 HTTP output budgets
+
+`newSettings` exposes `responseStartTimeoutMs` (default 15s) and
+`streamTotalTimeoutMs` (default 60s), in addition to the JS-05
+`managedSendTimeoutMs` (default 15s). Managed static-file responses are
+streamed in 16KiB chunks with bounded per-chunk and whole-stream deadlines.
+HTTP Upgrade is excluded from the response-start deadline once begun.
+
+These limits govern network output and the response-start phase; they cannot
+preempt an indefinitely running application Future or guarantee RSS returns
+to the OS. See `docs/upgrade_contract.md` and `tests/http/run_js06.sh`.

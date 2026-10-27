@@ -256,7 +256,7 @@ proc sendPinnedStatic(
       let chunk = readStaticChunk(asset.fd, count)
       if chunk.len != count:
         raise newException(IOError, "Static file changed during transfer")
-      await req.getNativeReq.client.send(chunk)
+      await req.getNativeReq.sendStreamChunk(chunk)
       remaining -= int64(chunk.len)
   except CatchableError:
     # Headers may already have been sent, so a second status line would
@@ -475,6 +475,7 @@ proc newSettings*(
   maxConnections = 64, maxHeaderBytes = 16384, maxHeaderFields = 100,
   headerTimeoutMs = 5000, bodyTimeoutMs = 15000,
   keepAliveTimeoutMs = 5000, managedSendTimeoutMs = 15000,
+  responseStartTimeoutMs = 15000, streamTotalTimeoutMs = 60000,
   trustedProxies: seq[string] = @[],
   allowedHosts: seq[string] = @[],
   publicBaseUrl = ""
@@ -493,6 +494,8 @@ proc newSettings*(
     bodyTimeoutMs: bodyTimeoutMs,
     keepAliveTimeoutMs: keepAliveTimeoutMs,
     managedSendTimeoutMs: managedSendTimeoutMs,
+    responseStartTimeoutMs: responseStartTimeoutMs,
+    streamTotalTimeoutMs: streamTotalTimeoutMs,
     trustedProxies: trustedProxies,
     allowedHosts: allowedHosts,
     publicBaseUrl: publicBaseUrl,
@@ -604,7 +607,9 @@ proc serve*(
     headerTimeoutMs = self.settings.headerTimeoutMs,
     bodyTimeoutMs = self.settings.bodyTimeoutMs,
     keepAliveTimeoutMs = self.settings.keepAliveTimeoutMs,
-    managedSendTimeoutMs = self.settings.managedSendTimeoutMs
+    managedSendTimeoutMs = self.settings.managedSendTimeoutMs,
+    responseStartTimeoutMs = self.settings.responseStartTimeoutMs,
+    streamTotalTimeoutMs = self.settings.streamTotalTimeoutMs
   )
   let serveFut = self.httpServer.serve(
     self.settings.port,
